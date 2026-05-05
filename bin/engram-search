@@ -26,6 +26,10 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+# Add lib/ to path for embeddings provider support
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
+
 # ---------------------------------------------------------------------------
 # Configuration (defaults, overridden by config.toml if present)
 # ---------------------------------------------------------------------------
@@ -104,22 +108,20 @@ load_config()
 # Embedding
 # ---------------------------------------------------------------------------
 def get_embedding(text: str) -> list:
-    """Get embedding vector from Ollama."""
+    """Get embedding vector using configured provider (default: Ollama)."""
     if not text.strip():
         return []
 
+    # Try using lib/embeddings.py provider abstraction first
     try:
-        import requests
-        resp = requests.post(
-            OLLAMA_URL,
-            json={"model": EMBEDDING_MODEL, "prompt": text[:2000]},
-            timeout=15,
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json().get("embedding", [])
-    except ImportError:
-        # Fallback: use urllib if requests not installed
+        from embeddings import get_provider, EmbeddingError
+        provider = get_provider()
+        return provider.embed(text[:2000])
+    except (ImportError, Exception):
+        pass
+
+    # Fallback: direct Ollama call (works without lib/ in path)
+    try:
         import urllib.request
         import urllib.error
         data = json.dumps({"model": EMBEDDING_MODEL, "prompt": text[:2000]}).encode()

@@ -77,9 +77,23 @@ create_lock() {
         if [ "$existing_agent" != "$AGENT_ID" ]; then
             local existing_time
             existing_time="$(sed -n '2p' "$lpath")"
-            echo "Error: File is locked by agent '$existing_agent' since $existing_time" >&2
-            echo "File: $file" >&2
-            exit 1
+
+            # Check if lock is stale (older than 1 hour)
+            local lock_epoch now_epoch age_seconds
+            lock_epoch=$(date -d "$existing_time" +%s 2>/dev/null || stat -c %Y "$lpath" 2>/dev/null || echo 0)
+            now_epoch=$(date +%s)
+            age_seconds=$((now_epoch - lock_epoch))
+            LOCK_TIMEOUT="${ENGRAM_LOCK_TIMEOUT:-3600}"  # default 1 hour
+
+            if [ "$age_seconds" -gt "$LOCK_TIMEOUT" ]; then
+                echo "Warning: Stale lock from '$existing_agent' (${age_seconds}s old). Breaking lock." >&2
+                rm -f "$lpath"
+            else
+                echo "Error: File is locked by agent '$existing_agent' since $existing_time" >&2
+                echo "File: $file" >&2
+                echo "Hint: set ENGRAM_LOCK_TIMEOUT=seconds or wait for auto-expiry (${LOCK_TIMEOUT}s)" >&2
+                exit 1
+            fi
         fi
         # Already locked by us — refresh timestamp
     fi

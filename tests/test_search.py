@@ -142,13 +142,13 @@ def test_search_no_ollama():
     with tempfile.TemporaryDirectory() as tmp:
         memory = create_test_memory(Path(tmp))
 
-        # Force Ollama to be unavailable
-        original_url = engram_search.OLLAMA_URL
-        engram_search.OLLAMA_URL = "http://127.0.0.1:99999/api/embeddings"
+        # Force Ollama to be unavailable by overriding get_embedding
+        original_get_embedding = engram_search.get_embedding
+        engram_search.get_embedding = lambda text: []
 
         result = engram_search.search("authentication", memory)
 
-        engram_search.OLLAMA_URL = original_url
+        engram_search.get_embedding = original_get_embedding
 
         assert result["status"] == "warning"
         assert "keywords" in result

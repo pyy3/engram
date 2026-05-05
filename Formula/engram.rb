@@ -1,7 +1,7 @@
 class Engram < Formula
   desc "Persistent 5-layer memory system for Claude Code and AI coding agents"
   homepage "https://github.com/grynn-in/engram"
-  url "https://github.com/grynn-in/engram/archive/refs/tags/v0.6.0.tar.gz"
+  url "https://github.com/grynn-in/engram/archive/refs/tags/v0.7.0.tar.gz"
   sha256 "PLACEHOLDER"
   license "MIT"
 
