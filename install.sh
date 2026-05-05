@@ -36,7 +36,7 @@ fi
 
 # 1. Install scripts
 mkdir -p "$BIN_DIR"
-for script in engram engram-init engram-start engram-end engram-search engram-sync engram-status engram-index engram-qdrant engram-hooks engram-template engram-export engram-import engram-setup; do
+for script in engram engram-init engram-start engram-end engram-search engram-sync engram-status engram-index engram-qdrant engram-hooks engram-template engram-export engram-import engram-setup engram-lint engram-compound engram-xref; do
   if [ -f "$SOURCE_DIR/bin/$script" ]; then
     cp "$SOURCE_DIR/bin/$script" "$BIN_DIR/$script"
     chmod +x "$BIN_DIR/$script"

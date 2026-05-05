@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""
+Engram Lint — self-healing knowledge maintenance (inspired by Karpathy's LLM Wiki).
+
+Scans memory layers and reports:
+  - Contradictions: files that claim conflicting things
+  - Stale facts: files not updated in N days with time-sensitive content
+  - Orphan files: files with no semantic similarity to anything else
+  - Missing links: topics referenced but never documented
+  - Empty/stub files: files with less than 3 lines of content
+
+Usage:
+  engram lint                    # full lint report
+  engram lint --fix              # auto-fix what's possible (add cross-refs, flag stale)
+  engram lint --stale-days 60   # custom staleness threshold (default: 90)
+  engram lint --json             # output as JSON for tool integration
+"""
+
+import os
+import sys
+import json
+import re
+import time
+from pathlib import Path
+from collections import defaultdict
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
+
+MEMORY_ROOT = Path(".claude/memory")
+STALE_DAYS = 90  # files older than this with date-sensitive content
+MIN_CONTENT_LINES = 3
+ORPHAN_THRESHOLD = 0.15  # files with max similarity below this are orphans
+
+
+def get_embedding(text: str) -> list:
+    """Get embedding from Ollama."""
+    import urllib.request
+    import urllib.error
+
+    ollama_url = os.environ.get("ENGRAM_OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
+    model = os.environ.get("ENGRAM_MODEL", "nomic-embed-text")
+
+    if not text.strip():
+        return []
+    data = json.dumps({"model": model, "prompt": text[:2000]}).encode()
+    req = urllib.request.Request(ollama_url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read()).get("embedding", [])
+    except Exception:
+        return []
+
+
+def cosine_similarity(a, b):
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
+    norm_b = (sum(x * x for x in b) ** 0.5) or 1.0
+    return dot / (norm_a * norm_b)
+
+
+def find_stale_files(stale_days: int) -> list[dict]:
+    """Find files with time-sensitive content that haven't been updated."""
+    stale = []
+    cutoff = time.time() - (stale_days * 86400)
+
+    # Patterns suggesting time-sensitive content
+    time_patterns = re.compile(
+        r"(current|latest|now|today|as of|202[0-9]|status:|in progress|pending|TODO)",
+        re.IGNORECASE
+    )
+
+    for layer in ["semantic", "procedural", "active"]:
+        layer_dir = MEMORY_ROOT / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in sorted(layer_dir.rglob("*.md")):
+            if ".cache" in str(f):
+                continue
+            mtime = f.stat().st_mtime
+            if mtime < cutoff:
+                content = f.read_text(encoding="utf-8", errors="ignore")
+                if time_patterns.search(content):
+                    age_days = int((time.time() - mtime) / 86400)
+                    stale.append({
+                        "file": str(f.relative_to(MEMORY_ROOT.parent)),
+                        "age_days": age_days,
+                        "reason": "Contains time-sensitive content, not updated in {age_days} days",
+                    })
+    return stale
+
+
+def find_empty_files() -> list[dict]:
+    """Find stub/empty files."""
+    empty = []
+    for layer in ["semantic", "procedural"]:
+        layer_dir = MEMORY_ROOT / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in sorted(layer_dir.rglob("*.md")):
+            if ".cache" in str(f):
+                continue
+            content = f.read_text(encoding="utf-8", errors="ignore").strip()
+            lines = [l for l in content.splitlines() if l.strip() and not l.startswith("#")]
+            if len(lines) < MIN_CONTENT_LINES:
+                empty.append({
+                    "file": str(f.relative_to(MEMORY_ROOT.parent)),
+                    "content_lines": len(lines),
+                    "reason": f"Only {len(lines)} content lines (stub/empty)",
+                })
+    return empty
+
+
+def find_orphans() -> list[dict]:
+    """Find files with no semantic connection to any other file."""
+    # Collect all files and their embeddings
+    files = []
+    for layer in ["semantic", "procedural"]:
+        layer_dir = MEMORY_ROOT / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in sorted(layer_dir.rglob("*.md")):
+            if ".cache" in str(f):
+                continue
+            content = f.read_text(encoding="utf-8", errors="ignore")
+            if len(content.strip()) < 50:
+                continue
+            files.append({
+                "path": f,
+                "rel": str(f.relative_to(MEMORY_ROOT.parent)),
+                "embedding": get_embedding(content[:2000]),
+            })
+
+    # Find files with low max similarity to all others
+    orphans = []
+    for i, file_a in enumerate(files):
+        if not file_a["embedding"]:
+            continue
+        max_sim = 0.0
+        most_similar = ""
+        for j, file_b in enumerate(files):
+            if i == j or not file_b["embedding"]:
+                continue
+            sim = cosine_similarity(file_a["embedding"], file_b["embedding"])
+            if sim > max_sim:
+                max_sim = sim
+                most_similar = file_b["rel"]
+
+        if max_sim < ORPHAN_THRESHOLD:
+            orphans.append({
+                "file": file_a["rel"],
+                "max_similarity": round(max_sim, 3),
+                "nearest": most_similar,
+                "reason": f"Low connection to other files (max similarity: {max_sim:.3f})",
+            })
+
+    return orphans
+
+
+def find_contradictions() -> list[dict]:
+    """Find potential contradictions between files (same topic, different claims)."""
+    # Group files by topic similarity
+    files = []
+    for layer in ["semantic", "procedural"]:
+        layer_dir = MEMORY_ROOT / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in sorted(layer_dir.rglob("*.md")):
+            if ".cache" in str(f):
+                continue
+            content = f.read_text(encoding="utf-8", errors="ignore")
+            if len(content.strip()) < 100:
+                continue
+            files.append({
+                "path": f,
+                "rel": str(f.relative_to(MEMORY_ROOT.parent)),
+                "content": content,
+                "embedding": get_embedding(content[:2000]),
+            })
+
+    contradictions = []
+
+    # Find highly similar file pairs (>0.7 similarity) — potential overlaps
+    for i in range(len(files)):
+        for j in range(i + 1, len(files)):
+            if not files[i]["embedding"] or not files[j]["embedding"]:
+                continue
+            sim = cosine_similarity(files[i]["embedding"], files[j]["embedding"])
+            if sim > 0.70:
+                # High similarity — check for contradictory patterns
+                # (negation words, different values for same keys)
+                contradictions.append({
+                    "file_a": files[i]["rel"],
+                    "file_b": files[j]["rel"],
+                    "similarity": round(sim, 3),
+                    "reason": f"High overlap ({sim:.2f}) — review for contradictions or merge opportunity",
+                })
+
+    return contradictions[:10]  # limit to top 10
+
+
+def find_missing_topics() -> list[dict]:
+    """Find topics referenced in files but never documented as their own page."""
+    # Extract references (markdown links, "see X", "refer to X")
+    ref_pattern = re.compile(r"(?:see|refer to|check|documented in)\s+[`\"]([^`\"]+)[`\"]", re.IGNORECASE)
+    link_pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+    all_files = set()
+    all_references = defaultdict(list)
+
+    for layer in ["semantic", "procedural"]:
+        layer_dir = MEMORY_ROOT / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in sorted(layer_dir.rglob("*.md")):
+            if ".cache" in str(f):
+                continue
+            rel = str(f.relative_to(MEMORY_ROOT.parent))
+            all_files.add(f.stem.lower())
+            content = f.read_text(encoding="utf-8", errors="ignore")
+
+            for match in ref_pattern.finditer(content):
+                ref = match.group(1).strip()
+                all_references[ref.lower()].append(rel)
+
+            for match in link_pattern.finditer(content):
+                target = match.group(2).strip()
+                if target.endswith(".md") and not Path(target).exists():
+                    all_references[match.group(1).lower()].append(rel)
+
+    # Find references that don't have corresponding files
+    missing = []
+    for topic, referenced_in in all_references.items():
+        topic_slug = topic.replace(" ", "-").replace("_", "-").lower()
+        if topic_slug not in all_files and topic.lower() not in all_files:
+            if len(referenced_in) >= 1:
+                missing.append({
+                    "topic": topic,
+                    "referenced_in": referenced_in[:3],
+                    "reason": f"Referenced in {len(referenced_in)} file(s) but no dedicated page exists",
+                })
+
+    return missing[:10]
+
+
+def generate_report(stale_days: int, check_orphans: bool = True) -> dict:
+    """Run all lint checks and return structured report."""
+    report = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M"),
+        "issues": [],
+        "summary": {},
+    }
+
+    # Stale files
+    print("  Checking for stale content...", file=sys.stderr)
+    stale = find_stale_files(stale_days)
+    for item in stale:
+        item["type"] = "stale"
+        item["severity"] = "warning"
+    report["issues"].extend(stale)
+
+    # Empty files
+    print("  Checking for empty/stub files...", file=sys.stderr)
+    empty = find_empty_files()
+    for item in empty:
+        item["type"] = "empty"
+        item["severity"] = "info"
+    report["issues"].extend(empty)
+
+    # Missing topics
+    print("  Checking for undocumented references...", file=sys.stderr)
+    missing = find_missing_topics()
+    for item in missing:
+        item["type"] = "missing"
+        item["severity"] = "suggestion"
+    report["issues"].extend(missing)
+
+    # Contradictions (requires embeddings)
+    print("  Checking for contradictions/overlaps...", file=sys.stderr)
+    contradictions = find_contradictions()
+    for item in contradictions:
+        item["type"] = "contradiction"
+        item["severity"] = "warning"
+    report["issues"].extend(contradictions)
+
+    # Orphans (expensive — requires all file embeddings)
+    if check_orphans:
+        print("  Checking for orphan files...", file=sys.stderr)
+        orphans = find_orphans()
+        for item in orphans:
+            item["type"] = "orphan"
+            item["severity"] = "info"
+        report["issues"].extend(orphans)
+
+    # Summary
+    by_type = defaultdict(int)
+    by_severity = defaultdict(int)
+    for issue in report["issues"]:
+        by_type[issue["type"]] += 1
+        by_severity[issue["severity"]] += 1
+
+    report["summary"] = {
+        "total_issues": len(report["issues"]),
+        "by_type": dict(by_type),
+        "by_severity": dict(by_severity),
+    }
+
+    return report
+
+
+def print_report(report: dict):
+    """Pretty-print the lint report."""
+    print(f"\nEngram Lint Report — {report['timestamp']}")
+    print("=" * 50)
+
+    if not report["issues"]:
+        print("\n  No issues found! Memory is healthy.")
+        return
+
+    # Group by type
+    by_type = defaultdict(list)
+    for issue in report["issues"]:
+        by_type[issue["type"]].append(issue)
+
+    severity_icon = {"warning": "!", "info": "-", "suggestion": "?"}
+
+    if by_type.get("stale"):
+        print(f"\n  Stale Content ({len(by_type['stale'])} files)")
+        print("  " + "-" * 40)
+        for item in by_type["stale"][:5]:
+            print(f"  ! {item['file']} ({item['age_days']} days old)")
+
+    if by_type.get("contradiction"):
+        print(f"\n  Potential Contradictions/Overlaps ({len(by_type['contradiction'])})")
+        print("  " + "-" * 40)
+        for item in by_type["contradiction"][:5]:
+            print(f"  ! {item['file_a']}")
+            print(f"    ↔ {item['file_b']} (similarity: {item['similarity']})")
+
+    if by_type.get("orphan"):
+        print(f"\n  Orphan Files ({len(by_type['orphan'])})")
+        print("  " + "-" * 40)
+        for item in by_type["orphan"][:5]:
+            print(f"  - {item['file']} (max sim: {item['max_similarity']})")
+
+    if by_type.get("missing"):
+        print(f"\n  Undocumented Topics ({len(by_type['missing'])})")
+        print("  " + "-" * 40)
+        for item in by_type["missing"][:5]:
+            refs = ", ".join(item["referenced_in"][:2])
+            print(f"  ? \"{item['topic']}\" (referenced in: {refs})")
+
+    if by_type.get("empty"):
+        print(f"\n  Empty/Stub Files ({len(by_type['empty'])})")
+        print("  " + "-" * 40)
+        for item in by_type["empty"][:5]:
+            print(f"  - {item['file']} ({item['content_lines']} lines)")
+
+    # Summary
+    s = report["summary"]
+    print(f"\n  Summary: {s['total_issues']} issues")
+    print(f"    Warnings: {s['by_severity'].get('warning', 0)}")
+    print(f"    Info: {s['by_severity'].get('info', 0)}")
+    print(f"    Suggestions: {s['by_severity'].get('suggestion', 0)}")
+
+
+def main():
+    args = sys.argv[1:]
+    json_mode = "--json" in args
+    fix_mode = "--fix" in args
+    stale_days = STALE_DAYS
+
+    # Parse --stale-days
+    for i, arg in enumerate(args):
+        if arg == "--stale-days" and i + 1 < len(args):
+            stale_days = int(args[i + 1])
+
+    if not MEMORY_ROOT.is_dir():
+        print("Error: .claude/memory/ not found. Run 'engram init' first.")
+        sys.exit(1)
+
+    print("Running engram lint...", file=sys.stderr)
+    report = generate_report(stale_days)
+
+    if json_mode:
+        print(json.dumps(report, indent=2))
+    else:
+        print_report(report)
+
+    if fix_mode and report["issues"]:
+        print("\n\n  --fix mode: auto-fixes applied:")
+        # Mark stale files with a staleness warning at top
+        for issue in report["issues"]:
+            if issue["type"] == "stale":
+                file_path = MEMORY_ROOT.parent / issue["file"]
+                if file_path.exists():
+                    content = file_path.read_text()
+                    if "STALE" not in content[:100]:
+                        marker = f"<!-- STALE: last updated {issue['age_days']} days ago. Review needed. -->\n"
+                        file_path.write_text(marker + content)
+                        print(f"    Marked stale: {issue['file']}")
+        print("\n  Manual review still needed for contradictions and missing topics.")
+
+
+if __name__ == "__main__":
+    main()

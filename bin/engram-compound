@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+Engram Compound — auto-save good search results as new knowledge pages.
+
+Inspired by Karpathy's LLM Wiki pattern where "good answers get filed back
+as new pages — explorations compound."
+
+Usage:
+  engram compound "topic"                    # search + save best synthesis
+  engram compound --from-search results.json # compound from saved search output
+  engram compound --review                   # show candidates for compounding
+
+How it works:
+  1. Searches memory for the topic
+  2. If multiple high-quality chunks are found across different files,
+     synthesizes them into a new semantic page
+  3. The new page references its sources (cross-links)
+  4. Only creates a page if it adds value (combines >= 2 sources)
+"""
+
+import os
+import sys
+import json
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+
+# Import search function
+import importlib.util
+_loader = importlib.machinery.SourceFileLoader("engram_search", str(SCRIPT_DIR / "engram-search"))
+_spec = importlib.util.spec_from_loader("engram_search", _loader)
+engram_search = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(engram_search)
+
+import importlib.machinery
+
+MEMORY_ROOT = Path(".claude/memory")
+
+
+def synthesize_page(topic: str, chunks: list[dict]) -> str:
+    """
+    Create a synthesized markdown page from multiple search results.
+    This is a structural synthesis — combines chunks with proper attribution.
+    (A full LLM synthesis would require an API call.)
+    """
+    today = time.strftime("%Y-%m-%d")
+    sources = set()
+    content_sections = []
+
+    for chunk in chunks:
+        source_file = chunk.get("file", "unknown")
+        sources.add(source_file)
+
+        heading = chunk.get("heading", "")
+        context = chunk.get("context", "")
+        text = chunk.get("text", "").strip()
+
+        if heading:
+            content_sections.append(f"### {heading}")
+            if context:
+                content_sections.append(f"_From: {context}_\n")
+        content_sections.append(text)
+        content_sections.append("")
+
+    # Build the page
+    lines = [
+        f"# {topic.title()}",
+        "",
+        f"_Compounded: {today} | Sources: {len(sources)} files_",
+        "",
+        "---",
+        "",
+    ]
+    lines.extend(content_sections)
+
+    # Add source references
+    lines.append("---")
+    lines.append("")
+    lines.append("## Sources")
+    lines.append("")
+    for src in sorted(sources):
+        lines.append(f"- `{src}`")
+
+    return "\n".join(lines)
+
+
+def should_compound(search_result: dict) -> bool:
+    """Determine if search results warrant a compounded page."""
+    chunks = search_result.get("chunks", [])
+    files = search_result.get("files", [])
+
+    # Need at least 2 high-quality chunks from different files
+    if len(chunks) < 2:
+        return False
+
+    unique_files = set(c.get("file", "") for c in chunks)
+    if len(unique_files) < 2:
+        return False
+
+    # At least one chunk with high score
+    if not any(c.get("score", 0) > 0.4 for c in chunks):
+        return False
+
+    return True
+
+
+def generate_filename(topic: str) -> str:
+    """Generate a clean filename from a topic."""
+    clean = topic.lower().strip()
+    clean = clean.replace(" ", "-").replace("/", "-").replace("\\", "-")
+    # Remove special chars
+    clean = "".join(c for c in clean if c.isalnum() or c == "-")
+    clean = clean[:50].strip("-")
+    return f"{clean}-compound.md"
+
+
+def main():
+    args = sys.argv[1:]
+    review_mode = "--review" in args
+    from_search = None
+
+    # Parse args
+    topic = ""
+    i = 0
+    while i < len(args):
+        if args[i] == "--from-search":
+            i += 1
+            if i < len(args):
+                from_search = args[i]
+        elif args[i] == "--review":
+            pass
+        elif not topic:
+            topic = args[i]
+        i += 1
+
+    if not topic and not from_search and not review_mode:
+        print("Usage: engram compound \"topic to synthesize\"")
+        print("")
+        print("Options:")
+        print("  --review             Show topics that could be compounded")
+        print("  --from-search FILE   Use saved search results (JSON)")
+        print("")
+        print("Creates a new semantic page that synthesizes knowledge from")
+        print("multiple existing files on the same topic.")
+        return
+
+    if not MEMORY_ROOT.is_dir():
+        print("Error: .claude/memory/ not found. Run 'engram init' first.")
+        sys.exit(1)
+
+    if review_mode:
+        # Show recent search topics that could benefit from compounding
+        print("Compound Review — topics with scattered knowledge:")
+        print("")
+        # Search for common structural terms
+        test_topics = ["setup", "workflow", "configuration", "deployment", "architecture"]
+        for test_topic in test_topics:
+            result = engram_search.search(test_topic, MEMORY_ROOT, limit=5)
+            if should_compound(result):
+                unique = set(c["file"] for c in result["chunks"])
+                print(f"  * \"{test_topic}\" — {len(result['chunks'])} chunks across {len(unique)} files")
+        print("")
+        print("Run: engram compound \"topic\" to create a synthesis page")
+        return
+
+    # Get search results
+    if from_search:
+        result = json.loads(Path(from_search).read_text())
+    else:
+        print(f"Searching for: \"{topic}\"...")
+        result = engram_search.search(topic, MEMORY_ROOT, force_chunks=True, limit=8)
+
+    chunks = result.get("chunks", [])
+    if not chunks:
+        print(f"No results found for \"{topic}\". Nothing to compound.")
+        return
+
+    if not should_compound(result):
+        print(f"Not enough diverse sources to compound \"{topic}\".")
+        print(f"  Found: {len(chunks)} chunks from {len(set(c['file'] for c in chunks))} file(s)")
+        print("  Need: 2+ chunks from 2+ different files with score > 0.4")
+        return
+
+    # Generate the compounded page
+    page_content = synthesize_page(topic, chunks[:6])
+    filename = generate_filename(topic)
+    output_path = MEMORY_ROOT / "semantic" / filename
+
+    if output_path.exists():
+        print(f"Page already exists: {output_path}")
+        print("Delete it first or choose a different topic.")
+        return
+
+    output_path.write_text(page_content)
+
+    unique_sources = set(c["file"] for c in chunks[:6])
+    print(f"\nCompounded: {output_path}")
+    print(f"  Sources: {len(unique_sources)} files")
+    print(f"  Chunks: {len(chunks[:6])} sections synthesized")
+    print("")
+    print("Review the generated page and refine as needed.")
+    print("The compounded knowledge now surfaces in future searches.")
+
+
+if __name__ == "__main__":
+    main()

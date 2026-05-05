@@ -122,6 +122,15 @@ if [ ! -f .claude/memory/.gitignore ]; then
 GI
 fi
 
+# 5b. Copy schema.md if available
+for candidate in "$ENGRAM_HOME/templates/default/schema.md" "$SCRIPT_DIR/../templates/default/schema.md"; do
+  if [ -f "$candidate" ] && [ ! -f .claude/memory/schema.md ]; then
+    cp "$candidate" .claude/memory/schema.md
+    echo "  Installed schema.md (knowledge governance rules)"
+    break
+  fi
+done
+
 # 6. Add memory protocol to CLAUDE.md if not present
 PROTOCOL_MARKER="## Engram"
 if [ ! -f CLAUDE.md ]; then

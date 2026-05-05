@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""
+Engram Cross-Reference — generate "See also" links between related files.
+
+Scans all semantic/ and procedural/ files, finds pairs with high similarity,
+and appends "See also:" sections to files that lack them.
+
+Usage:
+  engram xref                   # add cross-references to all files
+  engram xref --dry-run         # show what would be added
+  engram xref --threshold 0.5   # custom similarity threshold (default: 0.45)
+  engram xref --file FILE       # only update one specific file
+
+Inspired by Karpathy's LLM Wiki pattern of explicit cross-linking.
+"""
+
+import os
+import sys
+import json
+from pathlib import Path
+from collections import defaultdict
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
+
+MEMORY_ROOT = Path(".claude/memory")
+DEFAULT_THRESHOLD = 0.45
+MAX_REFS_PER_FILE = 5
+XREF_MARKER = "## See Also"
+
+
+def get_embedding(text: str) -> list:
+    """Get embedding from Ollama."""
+    import urllib.request
+    import urllib.error
+
+    ollama_url = os.environ.get("ENGRAM_OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
+    model = os.environ.get("ENGRAM_MODEL", "nomic-embed-text")
+
+    if not text.strip():
+        return []
+    data = json.dumps({"model": model, "prompt": text[:2000]}).encode()
+    req = urllib.request.Request(ollama_url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read()).get("embedding", [])
+    except Exception:
+        return []
+
+
+def cosine_similarity(a, b):
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
+    norm_b = (sum(x * x for x in b) ** 0.5) or 1.0
+    return dot / (norm_a * norm_b)
+
+
+def collect_files() -> list[dict]:
+    """Collect all memory files with embeddings."""
+    files = []
+    for layer in ["semantic", "procedural"]:
+        layer_dir = MEMORY_ROOT / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in sorted(layer_dir.rglob("*.md")):
+            if ".cache" in str(f):
+                continue
+            content = f.read_text(encoding="utf-8", errors="ignore")
+            if len(content.strip()) < 50:
+                continue
+
+            # Extract title (first # heading or filename)
+            title = f.stem.replace("-", " ").replace("_", " ").title()
+            for line in content.splitlines()[:5]:
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                    break
+
+            files.append({
+                "path": f,
+                "rel": str(f.relative_to(MEMORY_ROOT)),
+                "title": title,
+                "content": content,
+                "embedding": None,  # lazy load
+            })
+    return files
+
+
+def compute_similarities(files: list[dict], threshold: float) -> dict:
+    """Compute pairwise similarities and return graph of related files."""
+    # Get embeddings
+    print(f"  Embedding {len(files)} files...", file=sys.stderr)
+    for f in files:
+        f["embedding"] = get_embedding(f["content"][:2000])
+
+    # Compute similarity matrix
+    relations = defaultdict(list)  # file_rel -> [(score, related_rel, related_title)]
+
+    for i in range(len(files)):
+        if not files[i]["embedding"]:
+            continue
+        for j in range(i + 1, len(files)):
+            if not files[j]["embedding"]:
+                continue
+            sim = cosine_similarity(files[i]["embedding"], files[j]["embedding"])
+            if sim >= threshold:
+                relations[files[i]["rel"]].append((sim, files[j]["rel"], files[j]["title"]))
+                relations[files[j]["rel"]].append((sim, files[i]["rel"], files[i]["title"]))
+
+    # Sort by score and limit
+    for key in relations:
+        relations[key].sort(key=lambda x: -x[0])
+        relations[key] = relations[key][:MAX_REFS_PER_FILE]
+
+    return relations
+
+
+def has_xref_section(content: str) -> bool:
+    """Check if file already has a See Also section."""
+    return XREF_MARKER in content
+
+
+def build_xref_section(refs: list[tuple]) -> str:
+    """Build the See Also markdown section."""
+    lines = ["", "", XREF_MARKER, ""]
+    for score, rel_path, title in refs:
+        lines.append(f"- [{title}]({rel_path}) (similarity: {score:.2f})")
+    return "\n".join(lines)
+
+
+def update_xref_section(content: str, refs: list[tuple]) -> str:
+    """Replace existing See Also section or append new one."""
+    new_section = build_xref_section(refs)
+
+    if XREF_MARKER in content:
+        # Replace existing section (everything from marker to end or next ## heading)
+        parts = content.split(XREF_MARKER, 1)
+        before = parts[0].rstrip()
+        # Find next ## heading after the marker
+        after_marker = parts[1] if len(parts) > 1 else ""
+        lines_after = after_marker.splitlines()
+        remaining = ""
+        for i, line in enumerate(lines_after):
+            if i > 0 and line.startswith("## "):
+                remaining = "\n".join(lines_after[i:])
+                break
+
+        return before + new_section + ("\n\n" + remaining if remaining else "") + "\n"
+    else:
+        return content.rstrip() + new_section + "\n"
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    threshold = DEFAULT_THRESHOLD
+    target_file = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--threshold" and i + 1 < len(args):
+            threshold = float(args[i + 1])
+            i += 2
+        elif args[i] == "--file" and i + 1 < len(args):
+            target_file = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    if not MEMORY_ROOT.is_dir():
+        print("Error: .claude/memory/ not found. Run 'engram init' first.")
+        sys.exit(1)
+
+    files = collect_files()
+    if len(files) < 2:
+        print("Need at least 2 memory files to generate cross-references.")
+        return
+
+    print(f"Analyzing {len(files)} files (threshold: {threshold})...")
+    relations = compute_similarities(files, threshold)
+
+    if not relations:
+        print("No files above similarity threshold. Try lowering --threshold.")
+        return
+
+    # Apply cross-references
+    updated = 0
+    skipped = 0
+
+    for f in files:
+        if target_file and target_file not in str(f["path"]) and target_file != f["rel"]:
+            continue
+
+        refs = relations.get(f["rel"], [])
+        if not refs:
+            continue
+
+        if dry_run:
+            print(f"\n  {f['rel']}:")
+            for score, rel, title in refs:
+                print(f"    → {title} ({rel}) [{score:.2f}]")
+            updated += 1
+        else:
+            new_content = update_xref_section(f["content"], refs)
+            if new_content != f["content"]:
+                f["path"].write_text(new_content)
+                updated += 1
+                print(f"  Updated: {f['rel']} (+{len(refs)} refs)")
+            else:
+                skipped += 1
+
+    print(f"\n{'Would update' if dry_run else 'Updated'}: {updated} files")
+    if skipped:
+        print(f"Skipped: {skipped} (unchanged)")
+
+    if dry_run and updated:
+        print("\nRun without --dry-run to apply changes.")
+
+
+if __name__ == "__main__":
+    main()

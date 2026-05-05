@@ -37,6 +37,9 @@ Usage:
   engram export [file.tar.gz] [--all]      Export memory for transfer
   engram import <file.tar.gz> [--merge]    Import memory from archive
   engram setup [--ollama|--cache|--qdrant] Prepare new system after import
+  engram lint [--fix] [--json]             Find stale, orphan, contradictory content
+  engram compound "topic"                  Synthesize scattered knowledge into page
+  engram xref [--dry-run]                  Generate cross-reference links
   engram index [--incremental] [--status]  Build/update Qdrant vector index
   engram qdrant <download|start|stop>      Manage Qdrant binary
   engram hooks <install|remove|status>     Manage Claude Code hooks
@@ -102,6 +105,18 @@ case "${1:-}" in
   status)
     shift
     exec "$BIN_DIR/engram-status" "$@"
+    ;;
+  lint)
+    shift
+    exec python3 "$BIN_DIR/engram-lint" "$@"
+    ;;
+  compound)
+    shift
+    exec python3 "$BIN_DIR/engram-compound" "$@"
+    ;;
+  xref)
+    shift
+    exec python3 "$BIN_DIR/engram-xref" "$@"
     ;;
   hooks)
     shift
