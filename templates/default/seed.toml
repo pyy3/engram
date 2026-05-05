@@ -1,0 +1,7 @@
+# Default Engram template
+# This template is used when no --template flag is specified.
+
+[meta]
+name = "default"
+description = "Minimal memory structure with no pre-seeded knowledge"
+version = "0.1.0"

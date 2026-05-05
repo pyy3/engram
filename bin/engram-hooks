@@ -1,0 +1,223 @@
+#!/bin/bash
+# Engram Hooks — manage Claude Code hook integration.
+#
+# Usage:
+#   engram hooks install    # add hooks to .claude/settings.json
+#   engram hooks remove     # remove engram hooks
+#   engram hooks status     # show installed hooks
+#
+# Hooks added:
+#   - PreToolUse: no-op (placeholder for future guardrails)
+#   - Stop (session end): auto-runs engram end
+
+set -euo pipefail
+
+SETTINGS_FILE=".claude/settings.json"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+usage() {
+  cat << 'EOF'
+Engram Hooks — Claude Code integration
+
+Usage:
+  engram hooks install    Add auto-checkpoint hooks to .claude/settings.json
+  engram hooks remove     Remove engram hooks
+  engram hooks status     Show installed hook status
+
+Hooks installed:
+  - PostToolUse counter: checkpoints every N tool calls
+  - Session end: always runs engram end on exit
+EOF
+}
+
+ensure_settings() {
+  mkdir -p .claude
+  if [ ! -f "$SETTINGS_FILE" ]; then
+    echo '{}' > "$SETTINGS_FILE"
+  fi
+}
+
+cmd_install() {
+  ensure_settings
+
+  # Create the hook script
+  local hook_script=".claude/scripts/engram-hook-checkpoint"
+  mkdir -p .claude/scripts
+
+  cat > "$hook_script" << 'HOOK'
+#!/bin/bash
+# Engram auto-checkpoint hook for Claude Code.
+# Tracks tool call count and runs engram-end every N calls.
+#
+# This runs as a PostToolUse hook. Claude Code passes tool info via env vars.
+
+COUNTER_FILE="/tmp/engram-hook-counter-$$"
+CHECKPOINT_INTERVAL="${ENGRAM_CHECKPOINT_INTERVAL:-20}"
+
+# Initialize or read counter
+if [ -f "$COUNTER_FILE" ]; then
+  COUNT=$(cat "$COUNTER_FILE")
+else
+  COUNT=0
+fi
+
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$COUNTER_FILE"
+
+# Auto-checkpoint at interval
+if [ $((COUNT % CHECKPOINT_INTERVAL)) -eq 0 ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  if [ -f "$SCRIPT_DIR/engram-end" ]; then
+    bash "$SCRIPT_DIR/engram-end" "Auto-checkpoint (${COUNT} tool calls)" >/dev/null 2>&1
+  fi
+fi
+HOOK
+  chmod +x "$hook_script"
+
+  # Create session-end hook
+  local end_hook=".claude/scripts/engram-hook-session-end"
+  cat > "$end_hook" << 'ENDHOOK'
+#!/bin/bash
+# Engram session-end hook — always checkpoint on exit.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [ -f "$SCRIPT_DIR/engram-end" ]; then
+  bash "$SCRIPT_DIR/engram-end" "Session end (auto-checkpoint)"
+fi
+# Clean up counter
+rm -f /tmp/engram-hook-counter-*
+ENDHOOK
+  chmod +x "$end_hook"
+
+  # Update settings.json to register hooks
+  python3 - "$SETTINGS_FILE" << 'PYTHON'
+import sys
+import json
+from pathlib import Path
+
+settings_path = sys.argv[1]
+settings = json.loads(Path(settings_path).read_text())
+
+# Ensure hooks section exists
+if "hooks" not in settings:
+    settings["hooks"] = {}
+
+# Add PostToolUse hook
+settings["hooks"]["PostToolUse"] = [
+    {
+        "type": "command",
+        "command": "bash .claude/scripts/engram-hook-checkpoint",
+        "description": "Engram: auto-checkpoint counter"
+    }
+]
+
+# Add Stop hook (session end)
+settings["hooks"]["Stop"] = [
+    {
+        "type": "command",
+        "command": "bash .claude/scripts/engram-hook-session-end",
+        "description": "Engram: session-end checkpoint"
+    }
+]
+
+Path(settings_path).write_text(json.dumps(settings, indent=2) + "\n")
+print("  Hooks registered in .claude/settings.json")
+PYTHON
+
+  echo "Engram hooks installed:"
+  echo "  - PostToolUse: auto-checkpoint every ${ENGRAM_CHECKPOINT_INTERVAL:-20} tool calls"
+  echo "  - Stop: checkpoint on session end"
+  echo ""
+  echo "Configure interval: export ENGRAM_CHECKPOINT_INTERVAL=15"
+}
+
+cmd_remove() {
+  if [ ! -f "$SETTINGS_FILE" ]; then
+    echo "No settings file found."
+    return
+  fi
+
+  python3 - "$SETTINGS_FILE" << 'PYTHON'
+import sys
+import json
+from pathlib import Path
+
+settings_path = sys.argv[1]
+settings = json.loads(Path(settings_path).read_text())
+
+hooks = settings.get("hooks", {})
+changed = False
+
+# Remove engram hooks
+for event in ["PostToolUse", "Stop"]:
+    if event in hooks:
+        hooks[event] = [h for h in hooks[event] if "engram" not in h.get("command", "")]
+        if not hooks[event]:
+            del hooks[event]
+        changed = True
+
+if changed:
+    settings["hooks"] = hooks
+    Path(settings_path).write_text(json.dumps(settings, indent=2) + "\n")
+    print("  Engram hooks removed from settings.json")
+else:
+    print("  No engram hooks found in settings.json")
+PYTHON
+
+  # Remove hook scripts
+  rm -f .claude/scripts/engram-hook-checkpoint
+  rm -f .claude/scripts/engram-hook-session-end
+  echo "Hook scripts removed."
+}
+
+cmd_status() {
+  if [ ! -f "$SETTINGS_FILE" ]; then
+    echo "No .claude/settings.json found."
+    echo "Run: engram hooks install"
+    return
+  fi
+
+  echo "Engram Hook Status"
+  echo "=================="
+
+  python3 - "$SETTINGS_FILE" << 'PYTHON'
+import sys
+import json
+from pathlib import Path
+
+settings_path = sys.argv[1]
+settings = json.loads(Path(settings_path).read_text())
+hooks = settings.get("hooks", {})
+
+found = False
+for event, handlers in hooks.items():
+    for h in handlers:
+        if "engram" in h.get("command", "") or "engram" in h.get("description", ""):
+            print(f"  {event}: {h.get('description', h.get('command', '?'))}")
+            found = True
+
+if not found:
+    print("  No engram hooks installed.")
+    print("  Run: engram hooks install")
+PYTHON
+
+  # Show counter state
+  local counter_file
+  counter_file=$(ls /tmp/engram-hook-counter-* 2>/dev/null | head -1) || true
+  if [ -n "$counter_file" ]; then
+    echo ""
+    echo "  Current tool call count: $(cat "$counter_file")"
+    echo "  Checkpoint interval: ${ENGRAM_CHECKPOINT_INTERVAL:-20}"
+  fi
+}
+
+case "${1:-}" in
+  install)  cmd_install ;;
+  remove)   cmd_remove ;;
+  status)   cmd_status ;;
+  help|--help|-h|"") usage ;;
+  *)
+    echo "Unknown command: $1"
+    usage
+    exit 1
+    ;;
+esac

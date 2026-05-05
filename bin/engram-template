@@ -1,0 +1,258 @@
+#!/bin/bash
+# Engram Template Manager — create, list, and install knowledge templates.
+#
+# Usage:
+#   engram template list                     # show installed templates
+#   engram template create <name>            # export current project's knowledge as template
+#   engram template install <git-url|path>   # install a template from repo or directory
+#   engram template info <name>              # show template details
+
+set -euo pipefail
+
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+TEMPLATES_DIR="$ENGRAM_HOME/templates"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Also check repo templates
+REPO_TEMPLATES="$SCRIPT_DIR/../templates"
+
+usage() {
+  cat << 'EOF'
+Engram Template Manager
+
+Usage:
+  engram template list                    Show installed templates
+  engram template create <name>           Export current project knowledge as template
+  engram template install <url|path>      Install template from git repo or directory
+  engram template info <name>             Show template details
+
+Templates are stored in: ~/.engram/templates/
+
+Creating a template exports semantic/ and procedural/ from the current project,
+scrubbing project-specific details (interactive).
+EOF
+}
+
+cmd_list() {
+  echo "Installed Templates"
+  echo "==================="
+  echo ""
+
+  local found=false
+
+  # Check ENGRAM_HOME/templates/
+  if [ -d "$TEMPLATES_DIR" ]; then
+    for dir in "$TEMPLATES_DIR"/*/; do
+      [ -d "$dir" ] || continue
+      local name
+      name=$(basename "$dir")
+      local desc=""
+
+      # Try to read description from seed.toml
+      if [ -f "$dir/seed.toml" ]; then
+        desc=$(grep "^description" "$dir/seed.toml" 2>/dev/null | head -1 | sed 's/.*= *"//;s/"//' || echo "")
+      fi
+
+      local sem_count proc_count
+      sem_count=$(find "$dir/semantic" -name "*.md" -type f 2>/dev/null | wc -l)
+      proc_count=$(find "$dir/procedural" -name "*.md" -type f 2>/dev/null | wc -l)
+
+      printf "  %-20s %s\n" "$name" "$desc"
+      printf "  %-20s semantic: %d, procedural: %d\n" "" "$sem_count" "$proc_count"
+      echo ""
+      found=true
+    done
+  fi
+
+  if [ "$found" = false ]; then
+    echo "  No templates installed."
+    echo ""
+    echo "  Create one: engram template create my-domain"
+    echo "  Install:    engram template install https://github.com/user/engram-template-x"
+  fi
+}
+
+cmd_create() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "Usage: engram template create <name>"
+    echo "Example: engram template create web-development"
+    exit 1
+  fi
+
+  local target="$TEMPLATES_DIR/$name"
+  if [ -d "$target" ]; then
+    echo "Template '$name' already exists at $target"
+    echo "Delete it first if you want to recreate."
+    exit 1
+  fi
+
+  local memory_root=".claude/memory"
+  if [ ! -d "$memory_root" ]; then
+    echo "Error: .claude/memory/ not found. Run 'engram init' first."
+    exit 1
+  fi
+
+  echo "Creating template '$name' from current project memory..."
+  echo ""
+
+  mkdir -p "$target/semantic" "$target/procedural"
+
+  # Copy semantic files
+  local sem_count=0
+  if [ -d "$memory_root/semantic" ]; then
+    for f in "$memory_root/semantic/"*.md; do
+      [ -f "$f" ] || continue
+      cp "$f" "$target/semantic/"
+      sem_count=$((sem_count + 1))
+      echo "  + semantic/$(basename "$f")"
+    done
+  fi
+
+  # Copy procedural files
+  local proc_count=0
+  if [ -d "$memory_root/procedural" ]; then
+    for f in "$memory_root/procedural/"*.md; do
+      [ -f "$f" ] || continue
+      cp "$f" "$target/procedural/"
+      proc_count=$((proc_count + 1))
+      echo "  + procedural/$(basename "$f")"
+    done
+  fi
+
+  # Generate seed.toml
+  cat > "$target/seed.toml" << TOML
+# Template: $name
+# Created: $(date +%Y-%m-%d)
+# Source project: $(basename "$(pwd)")
+
+[meta]
+name = "$name"
+description = "Knowledge template exported from $(basename "$(pwd)")"
+version = "0.1.0"
+created = "$(date +%Y-%m-%d)"
+TOML
+
+  # Copy claude.md.snippet if exists in default template
+  if [ -f "$REPO_TEMPLATES/default/claude.md.snippet" ]; then
+    cp "$REPO_TEMPLATES/default/claude.md.snippet" "$target/claude.md.snippet"
+  fi
+
+  echo ""
+  echo "Template created: $target"
+  echo "  semantic:   $sem_count files"
+  echo "  procedural: $proc_count files"
+  echo ""
+  echo "IMPORTANT: Review files for project-specific content."
+  echo "Replace company names, URLs, etc. with placeholders:"
+  echo "  <COMPANY>, <PROJECT>, <API_URL>, <DOMAIN>"
+  echo ""
+  echo "Use in new projects: engram init --template $name"
+}
+
+cmd_install() {
+  local source="${1:-}"
+  if [ -z "$source" ]; then
+    echo "Usage: engram template install <git-url|path>"
+    echo ""
+    echo "Examples:"
+    echo "  engram template install https://github.com/user/engram-template-react"
+    echo "  engram template install ~/my-templates/python"
+    exit 1
+  fi
+
+  mkdir -p "$TEMPLATES_DIR"
+
+  # Determine if git URL or local path
+  if [[ "$source" == http* ]] || [[ "$source" == git@* ]]; then
+    # Git clone
+    local name
+    name=$(basename "$source" .git | sed 's/engram-template-//')
+    local target="$TEMPLATES_DIR/$name"
+
+    if [ -d "$target" ]; then
+      echo "Template '$name' already exists. Updating..."
+      cd "$target" && git pull
+    else
+      echo "Cloning template: $source → $target"
+      git clone "$source" "$target"
+    fi
+
+    echo "Template '$name' installed."
+  else
+    # Local path copy
+    local source_path
+    source_path=$(realpath "$source")
+    local name
+    name=$(basename "$source_path")
+    local target="$TEMPLATES_DIR/$name"
+
+    if [ ! -d "$source_path" ]; then
+      echo "Error: $source_path not found"
+      exit 1
+    fi
+
+    echo "Copying template: $source_path → $target"
+    cp -r "$source_path" "$target"
+    echo "Template '$name' installed."
+  fi
+
+  echo ""
+  echo "Use: engram init --template $(basename "$target")"
+}
+
+cmd_info() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    echo "Usage: engram template info <name>"
+    exit 1
+  fi
+
+  local dir="$TEMPLATES_DIR/$name"
+  if [ ! -d "$dir" ]; then
+    # Try repo templates
+    dir="$REPO_TEMPLATES/$name"
+  fi
+
+  if [ ! -d "$dir" ]; then
+    echo "Template '$name' not found."
+    echo "Run: engram template list"
+    exit 1
+  fi
+
+  echo "Template: $name"
+  echo "Location: $dir"
+  echo ""
+
+  if [ -f "$dir/seed.toml" ]; then
+    echo "--- seed.toml ---"
+    cat "$dir/seed.toml"
+    echo ""
+  fi
+
+  echo "--- Files ---"
+  for layer in semantic procedural; do
+    if [ -d "$dir/$layer" ]; then
+      local count
+      count=$(find "$dir/$layer" -name "*.md" -type f 2>/dev/null | wc -l)
+      echo "  $layer/: $count files"
+      find "$dir/$layer" -name "*.md" -type f 2>/dev/null | while read -r f; do
+        local size
+        size=$(wc -c < "$f" | tr -d ' ')
+        printf "    %-40s %s bytes\n" "$(basename "$f")" "$size"
+      done
+    fi
+  done
+}
+
+case "${1:-}" in
+  list)     cmd_list ;;
+  create)   shift; cmd_create "$@" ;;
+  install)  shift; cmd_install "$@" ;;
+  info)     shift; cmd_info "$@" ;;
+  help|--help|-h|"") usage ;;
+  *)
+    echo "Unknown command: $1"
+    usage
+    exit 1
+    ;;
+esac

@@ -1,0 +1,12 @@
+# D365 Finance & Operations template
+# Pre-seeds memory with transferable D365 F&O knowledge.
+
+[meta]
+name = "d365"
+description = "Microsoft Dynamics 365 Finance & Operations domain knowledge"
+version = "0.1.0"
+
+[meta.tags]
+domain = "erp"
+product = "dynamics-365"
+modules = ["finance", "supply-chain", "procurement", "manufacturing"]

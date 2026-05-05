@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""
+Engram Index — build/update Qdrant vector index from memory files.
+
+Usage:
+  engram index                    # full re-index
+  engram index --incremental      # only new/changed files
+  engram index --status           # show index stats
+  engram index --reset            # delete collection and rebuild
+
+Requires:
+  - Qdrant running (auto-started if binary exists at ~/.engram/qdrant/)
+  - Ollama with embedding model (for vector generation)
+
+The index is optional — search falls back to file-based if Qdrant unavailable.
+"""
+
+import os
+import sys
+import json
+import hashlib
+import time
+from pathlib import Path
+
+# Add lib/ to path
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
+
+from qdrant import QdrantClient, QdrantError
+
+# Configuration
+QDRANT_URL = os.environ.get("ENGRAM_QDRANT_URL", "http://127.0.0.1:6333")
+OLLAMA_URL = os.environ.get("ENGRAM_OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
+EMBEDDING_MODEL = os.environ.get("ENGRAM_MODEL", "nomic-embed-text")
+VECTOR_SIZE = 384  # nomic-embed-text dimension
+CHUNK_THRESHOLD = 200
+MAX_CHUNK_CHARS = 1800
+
+
+def load_config():
+    """Load config from TOML file."""
+    global QDRANT_URL, OLLAMA_URL, EMBEDDING_MODEL, VECTOR_SIZE
+
+    config_path = os.environ.get("ENGRAM_CONFIG", os.path.expanduser("~/.config/engram/config.toml"))
+    if not os.path.exists(config_path):
+        return
+
+    try:
+        content = Path(config_path).read_text()
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("["):
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+
+            if key == "url" and "qdrant" in content[:content.find(key)].rsplit("[", 1)[-1]:
+                QDRANT_URL = val
+            elif key == "model":
+                EMBEDDING_MODEL = val
+            elif key == "vector_size":
+                VECTOR_SIZE = int(val)
+    except Exception:
+        pass
+
+
+load_config()
+
+
+def get_collection_name() -> str:
+    """Generate collection name from project path (deterministic hash)."""
+    cwd = os.getcwd()
+    path_hash = hashlib.md5(cwd.encode()).hexdigest()[:12]
+    # Clean project name for collection
+    project_name = Path(cwd).name.replace(" ", "-").replace(".", "_")[:20]
+    return f"engram-{project_name}-{path_hash}"
+
+
+def get_embedding(text: str) -> list:
+    """Get embedding from Ollama."""
+    import urllib.request
+    import urllib.error
+
+    if not text.strip():
+        return []
+
+    data = json.dumps({"model": EMBEDDING_MODEL, "prompt": text[:2000]}).encode()
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read()).get("embedding", [])
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Embedding failed: {e}", file=sys.stderr)
+        return []
+
+
+def file_content_hash(file_path: Path) -> str:
+    """Hash file content for change detection."""
+    content = file_path.read_bytes()
+    return hashlib.sha256(content).hexdigest()[:16]
+
+
+def chunk_file(content: str, file_path: str) -> list[dict]:
+    """Split markdown into chunks at heading boundaries."""
+    import re
+
+    lines = content.splitlines()
+    heading_re = re.compile(r"^(#{1,4})\s+(.+)$")
+    chunks = []
+    parents = {}
+    current_heading = Path(file_path).stem  # use filename as default heading
+    current_context = ""
+    current_lines = []
+    current_start = 0
+
+    for i, line in enumerate(lines):
+        m = heading_re.match(line)
+        if m:
+            if current_lines:
+                text = "\n".join(current_lines).strip()
+                if text and len(text) > 40:
+                    chunks.append({
+                        "heading": current_heading,
+                        "context": current_context,
+                        "text": text[:MAX_CHUNK_CHARS],
+                        "line": current_start + 1,
+                    })
+
+            level = len(m.group(1))
+            heading_text = m.group(2).strip()
+            parents[level] = heading_text
+            for child_level in range(level + 1, 5):
+                parents.pop(child_level, None)
+
+            context_parts = [parents[pl] for pl in sorted(parents.keys()) if pl < level]
+            current_context = " > ".join(context_parts) if context_parts else ""
+            current_heading = heading_text
+            current_lines = [line]
+            current_start = i
+        else:
+            current_lines.append(line)
+
+    # Final chunk
+    if current_lines:
+        text = "\n".join(current_lines).strip()
+        if text and len(text) > 40:
+            chunks.append({
+                "heading": current_heading,
+                "context": current_context,
+                "text": text[:MAX_CHUNK_CHARS],
+                "line": current_start + 1,
+            })
+
+    # For small files, return single chunk with full content
+    if not chunks and content.strip():
+        chunks.append({
+            "heading": Path(file_path).stem,
+            "context": "",
+            "text": content[:MAX_CHUNK_CHARS],
+            "line": 1,
+        })
+
+    return chunks
+
+
+def index_memory(memory_root: Path, client: QdrantClient, collection: str, incremental: bool = False):
+    """Index all memory files into Qdrant."""
+
+    # Load existing index metadata (for incremental)
+    meta_file = memory_root / ".cache" / "_qdrant_index_meta.json"
+    indexed_hashes = {}
+    if incremental and meta_file.exists():
+        try:
+            indexed_hashes = json.loads(meta_file.read_text())
+        except Exception:
+            pass
+
+    # Collect files
+    files = sorted(memory_root.rglob("*.md"))
+    files = [f for f in files if ".cache" not in str(f)]
+
+    if not files:
+        print("No memory files found.")
+        return
+
+    print(f"Scanning {len(files)} memory files...")
+
+    points = []
+    point_id = 0
+    new_hashes = {}
+    skipped = 0
+    indexed = 0
+
+    for file_path in files:
+        rel_path = str(file_path.relative_to(memory_root.parent))
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        content_hash = file_content_hash(file_path)
+
+        # Skip unchanged files in incremental mode
+        if incremental and indexed_hashes.get(rel_path) == content_hash:
+            new_hashes[rel_path] = content_hash
+            skipped += 1
+            continue
+
+        # Determine layer from path
+        layer = "unknown"
+        for l in ["active", "semantic", "procedural", "lossless"]:
+            if f"/{l}/" in str(file_path) or str(file_path).endswith(f"/{l}"):
+                layer = l
+                break
+
+        # Chunk the file
+        chunks = chunk_file(content, rel_path)
+
+        for chunk in chunks:
+            # Build embeddable text
+            embed_text = ""
+            if chunk["context"]:
+                embed_text += chunk["context"] + "\n"
+            embed_text += chunk["heading"] + "\n"
+            embed_text += chunk["text"]
+
+            embedding = get_embedding(embed_text)
+            if not embedding:
+                continue
+
+            point_id += 1
+            points.append({
+                "id": point_id,
+                "vector": embedding,
+                "payload": {
+                    "file": rel_path,
+                    "heading": chunk["heading"],
+                    "context": chunk["context"],
+                    "text": chunk["text"],
+                    "line": chunk["line"],
+                    "layer": layer,
+                    "content_hash": content_hash,
+                },
+            })
+
+            # Batch upsert every 50 points
+            if len(points) >= 50:
+                client.upsert(collection, points)
+                indexed += len(points)
+                print(f"  Indexed {indexed} chunks...", end="\r")
+                points = []
+
+        new_hashes[rel_path] = content_hash
+
+    # Final batch
+    if points:
+        client.upsert(collection, points)
+        indexed += len(points)
+
+    # Save index metadata
+    meta_file.parent.mkdir(parents=True, exist_ok=True)
+    meta_file.write_text(json.dumps(new_hashes, indent=2))
+
+    print(f"\nDone: {indexed} chunks indexed, {skipped} files unchanged")
+
+
+def show_status(client: QdrantClient, collection: str):
+    """Show index statistics."""
+    if not client.healthy():
+        print("Qdrant: not running")
+        return
+
+    if not client.collection_exists(collection):
+        print(f"Collection '{collection}': not created")
+        print("Run: engram index")
+        return
+
+    count = client.count(collection)
+    print(f"Collection: {collection}")
+    print(f"Chunks indexed: {count}")
+
+    # Show layer breakdown
+    for layer in ["semantic", "procedural", "active", "lossless"]:
+        try:
+            filter_ = {"must": [{"key": "layer", "match": {"value": layer}}]}
+            # Use scroll with filter to count
+            points, _ = client.scroll(collection, limit=1, filter_=filter_)
+            # Rough count via search
+        except Exception:
+            pass
+
+    meta_file = Path(".claude/memory/.cache/_qdrant_index_meta.json")
+    if meta_file.exists():
+        meta = json.loads(meta_file.read_text())
+        print(f"Files tracked: {len(meta)}")
+        # Find last indexed time
+        mtime = meta_file.stat().st_mtime
+        age = time.time() - mtime
+        if age < 60:
+            print(f"Last indexed: {int(age)}s ago")
+        elif age < 3600:
+            print(f"Last indexed: {int(age / 60)}m ago")
+        else:
+            print(f"Last indexed: {int(age / 3600)}h ago")
+
+
+def try_start_qdrant() -> bool:
+    """Try to start Qdrant if binary exists."""
+    import subprocess
+
+    engram_home = Path(os.environ.get("ENGRAM_HOME", Path.home() / ".engram"))
+    qdrant_bin = engram_home / "qdrant" / "qdrant"
+
+    if not qdrant_bin.exists():
+        return False
+
+    storage_path = engram_home / "qdrant_data"
+    storage_path.mkdir(parents=True, exist_ok=True)
+
+    print(f"Starting Qdrant from {qdrant_bin}...")
+    subprocess.Popen(
+        [str(qdrant_bin), "--storage-path", str(storage_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait for startup
+    for _ in range(20):
+        time.sleep(0.5)
+        client = QdrantClient(QDRANT_URL)
+        if client.healthy():
+            print("Qdrant started.")
+            return True
+
+    print("Qdrant failed to start within 10s.", file=sys.stderr)
+    return False
+
+
+def main():
+    args = sys.argv[1:]
+    incremental = "--incremental" in args
+    show_stats = "--status" in args
+    reset = "--reset" in args
+
+    memory_root = Path(".claude/memory")
+    if not memory_root.is_dir():
+        print("Error: .claude/memory/ not found. Run 'engram init' first.")
+        sys.exit(1)
+
+    client = QdrantClient(QDRANT_URL)
+    collection = get_collection_name()
+
+    # Check Qdrant health
+    if not client.healthy():
+        # Try auto-starting
+        if not try_start_qdrant():
+            print("Qdrant is not running.")
+            print("")
+            print("To install Qdrant:")
+            print("  engram qdrant download")
+            print("")
+            print("Or start manually:")
+            print("  docker run -p 6333:6333 qdrant/qdrant")
+            sys.exit(1)
+
+    if show_stats:
+        show_status(client, collection)
+        return
+
+    if reset:
+        if client.collection_exists(collection):
+            client.delete_collection(collection)
+            print(f"Deleted collection: {collection}")
+        # Remove metadata
+        meta_file = memory_root / ".cache" / "_qdrant_index_meta.json"
+        if meta_file.exists():
+            meta_file.unlink()
+        incremental = False  # force full rebuild
+
+    # Ensure collection exists
+    if not client.collection_exists(collection):
+        client.create_collection(collection, vector_size=VECTOR_SIZE)
+        print(f"Created collection: {collection} (vector_size={VECTOR_SIZE})")
+        incremental = False  # new collection = full index
+
+    # Index
+    index_memory(memory_root, client, collection, incremental)
+
+    # Final stats
+    count = client.count(collection)
+    print(f"\nCollection '{collection}': {count} total chunks")
+
+
+if __name__ == "__main__":
+    main()

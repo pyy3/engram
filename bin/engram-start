@@ -1,0 +1,58 @@
+#!/bin/bash
+# Engram — Load cross-session memory into active context at session start.
+#
+# Usage: engram start "topic you're working on"
+#
+# What it does:
+#   1. Runs semantic + keyword search for the topic
+#   2. Appends current tasks from active layer
+#   3. Writes everything to active/context-inject.md
+#
+# Claude Code reads context-inject.md to understand past work relevant to today.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DATE=$(date +%Y-%m-%d)
+QUERY="${*:-Current project context and recent work}"
+
+CONTEXT_FILE=".claude/memory/active/context-inject.md"
+
+if [ ! -d ".claude/memory" ]; then
+  echo "Error: .claude/memory/ not found. Run 'engram init' first."
+  exit 1
+fi
+
+echo "=== SESSION START $DATE ===" > "$CONTEXT_FILE"
+echo "Current date: $DATE" >> "$CONTEXT_FILE"
+echo "Topic: $QUERY" >> "$CONTEXT_FILE"
+
+# Semantic + keyword search
+echo -e "\n=== Auto-recalled memory (semantic + keyword) ===" >> "$CONTEXT_FILE"
+if python3 "$SCRIPT_DIR/engram-search" "$QUERY" >> "$CONTEXT_FILE" 2>/dev/null; then
+  :
+else
+  echo "(Memory search unavailable — Ollama not running or no embeddings yet)" >> "$CONTEXT_FILE"
+  # Fallback: show recent lossless entries
+  LATEST_LOSSLESS=$(find .claude/memory/lossless -name "*.md" -type f 2>/dev/null | sort | tail -3)
+  if [ -n "$LATEST_LOSSLESS" ]; then
+    echo "" >> "$CONTEXT_FILE"
+    echo "=== Recent session logs (fallback) ===" >> "$CONTEXT_FILE"
+    for f in $LATEST_LOSSLESS; do
+      echo "--- $(basename "$f") ---" >> "$CONTEXT_FILE"
+      head -20 "$f" >> "$CONTEXT_FILE"
+      echo "" >> "$CONTEXT_FILE"
+    done
+  fi
+fi
+
+# Append current tasks
+echo -e "\n=== Active tasks (Layer 5) ===" >> "$CONTEXT_FILE"
+if [ -f .claude/memory/active/current-tasks.md ]; then
+  cat .claude/memory/active/current-tasks.md >> "$CONTEXT_FILE"
+else
+  echo "(No active tasks yet)" >> "$CONTEXT_FILE"
+fi
+
+echo "Context loaded: $CONTEXT_FILE"
+echo "Memory layers ready. Start working!"

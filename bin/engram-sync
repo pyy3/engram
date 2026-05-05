@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+Engram Sync — transfer knowledge between memory locations.
+
+Copies semantic/ and procedural/ layers (transferable knowledge).
+Skips active/ and lossless/ by default (session-specific).
+Invalidates stale embedding caches at the target.
+
+Usage:
+  engram sync <source> <target>              # sync transferable layers
+  engram sync <source> <target> --all        # sync all layers
+  engram sync <source> <target> --dry-run    # preview changes
+
+Source/target can be:
+  - A project path:  ~/my-project            (resolves to ~/my-project/.claude/memory/)
+  - A knowledge pool: ~/.engram/pools/domain
+  - Current dir:      .                      (resolves to ./.claude/memory/)
+
+Sync rules:
+  - New files at source -> copied to target
+  - Newer files at source -> overwrite target (by mtime)
+  - Files only at target -> kept (never deletes)
+  - .cache/ dirs -> invalidated at target (embeddings rebuild on next search)
+"""
+
+import sys
+import shutil
+from pathlib import Path
+
+TRANSFERABLE_LAYERS = ["semantic", "procedural"]
+ALL_LAYERS = ["semantic", "procedural", "lossless", "active"]
+
+
+def resolve_memory_root(path_str: str) -> Path:
+    """Resolve a user-provided path to the memory root directory."""
+    p = Path(path_str).expanduser().resolve()
+
+    # Direct memory root (has semantic/ or procedural/ children)
+    if (p / "semantic").is_dir() or (p / "procedural").is_dir():
+        return p
+
+    # Project root with .claude/memory/
+    mem = p / ".claude" / "memory"
+    if mem.is_dir():
+        return mem
+
+    # Existing directory — treat as memory root
+    if p.is_dir():
+        return p
+
+    return mem
+
+
+def sync_layer(source_root: Path, target_root: Path, layer: str, dry_run: bool) -> dict:
+    """Sync a single layer from source to target."""
+    result = {"new": [], "updated": [], "skipped": []}
+
+    source_dir = source_root / layer
+    target_dir = target_root / layer
+
+    if not source_dir.is_dir():
+        return result
+
+    if not dry_run:
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+    for src_file in sorted(source_dir.rglob("*")):
+        if src_file.is_dir():
+            continue
+        if ".cache" in str(src_file):
+            continue
+
+        rel = src_file.relative_to(source_dir)
+        tgt_file = target_dir / rel
+
+        if not tgt_file.exists():
+            result["new"].append(str(rel))
+            if not dry_run:
+                tgt_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, tgt_file)
+        elif src_file.stat().st_mtime > tgt_file.stat().st_mtime:
+            result["updated"].append(str(rel))
+            if not dry_run:
+                shutil.copy2(src_file, tgt_file)
+        else:
+            result["skipped"].append(str(rel))
+
+    return result
+
+
+def invalidate_cache(target_root: Path, dry_run: bool) -> int:
+    """Delete .cache/ at target so embeddings rebuild on next search."""
+    count = 0
+    cache_dir = target_root / ".cache"
+    if cache_dir.is_dir():
+        count = sum(1 for _ in cache_dir.rglob("*") if _.is_file())
+        if not dry_run:
+            shutil.rmtree(cache_dir)
+    return count
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    sync_all = "--all" in args
+    positional = [a for a in args if not a.startswith("--")]
+
+    if len(positional) < 2:
+        print("Usage: engram sync <source> <target> [--dry-run] [--all]")
+        print()
+        print("Examples:")
+        print("  engram sync ~/.engram/pools/my-domain .      # pull shared -> project")
+        print("  engram sync . ~/.engram/pools/my-domain      # push -> shared pool")
+        print("  engram sync ~/old-project ~/new-project      # migrate")
+        print("  engram sync ~/project-a ~/project-b --dry-run")
+        return
+
+    source = resolve_memory_root(positional[0])
+    target = resolve_memory_root(positional[1])
+
+    layers = ALL_LAYERS if sync_all else TRANSFERABLE_LAYERS
+
+    if dry_run:
+        print("DRY RUN — no files will be modified\n")
+
+    print(f"Source: {source}")
+    print(f"Target: {target}")
+    print(f"Layers: {', '.join(layers)}")
+    print()
+
+    if not source.exists():
+        print(f"Error: source not found: {source}")
+        sys.exit(1)
+
+    total_new = 0
+    total_updated = 0
+    total_skipped = 0
+
+    for layer in layers:
+        result = sync_layer(source, target, layer, dry_run)
+        n = len(result["new"])
+        u = len(result["updated"])
+        s = len(result["skipped"])
+        total_new += n
+        total_updated += u
+        total_skipped += s
+
+        if n or u:
+            print(f"  {layer}/: {n} new, {u} updated, {s} unchanged")
+            for f in result["new"]:
+                print(f"    + {f}")
+            for f in result["updated"]:
+                print(f"    ~ {f}")
+        elif s:
+            print(f"  {layer}/: {s} unchanged")
+        else:
+            src_dir = source / layer
+            if not src_dir.is_dir():
+                print(f"  {layer}/: (not present at source)")
+            else:
+                print(f"  {layer}/: empty")
+
+    # Invalidate cache if anything changed
+    if total_new + total_updated > 0:
+        cache_count = invalidate_cache(target, dry_run)
+        if cache_count:
+            action = "would remove" if dry_run else "removed"
+            print(f"\n  Cache: {action} {cache_count} cached embeddings (will rebuild on next search)")
+
+    print(f"\nSummary: {total_new} new, {total_updated} updated, {total_skipped} unchanged")
+
+    if dry_run and (total_new + total_updated > 0):
+        print("\nRun without --dry-run to apply changes.")
+
+
+if __name__ == "__main__":
+    main()

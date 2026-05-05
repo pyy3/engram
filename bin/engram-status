@@ -1,0 +1,54 @@
+#!/bin/bash
+# Engram — Show memory layer statistics.
+#
+# Usage: engram status
+
+set -euo pipefail
+
+MEMORY_ROOT=".claude/memory"
+
+if [ ! -d "$MEMORY_ROOT" ]; then
+  echo "Engram not initialized in this project."
+  echo "Run: engram init"
+  exit 1
+fi
+
+echo "Engram Memory Status"
+echo "===================="
+echo ""
+
+# Layer stats
+for layer in active semantic procedural lossless; do
+  dir="$MEMORY_ROOT/$layer"
+  if [ -d "$dir" ]; then
+    count=$(find "$dir" -name "*.md" -type f 2>/dev/null | wc -l)
+    size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+    printf "  %-12s %3d files  (%s)\n" "$layer/" "$count" "$size"
+  else
+    printf "  %-12s (not created)\n" "$layer/"
+  fi
+done
+
+# Cache stats
+cache_dir="$MEMORY_ROOT/.cache"
+if [ -d "$cache_dir" ]; then
+  cache_count=$(find "$cache_dir" -type f 2>/dev/null | wc -l)
+  cache_size=$(du -sh "$cache_dir" 2>/dev/null | cut -f1)
+  echo ""
+  echo "  Cache: $cache_count files ($cache_size)"
+fi
+
+# Last checkpoint
+last_chunk=$(find "$MEMORY_ROOT/lossless" -name "*.md" -type f 2>/dev/null | sort | tail -1)
+if [ -n "${last_chunk:-}" ]; then
+  echo ""
+  echo "  Last checkpoint: $(basename "$last_chunk" .md | tr '_' ' ')"
+fi
+
+# Ollama status
+echo ""
+if curl -s -o /dev/null "http://127.0.0.1:11434" 2>/dev/null; then
+  echo "  Ollama: running (semantic search available)"
+else
+  echo "  Ollama: not running (keyword search only)"
+fi

@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""
+Engram Memory Search — semantic + keyword search over .claude/memory/
+
+Features:
+  - File-level semantic search (all .md files)
+  - Chunk-level drill-down for large files (splits at ## / ### / #### headings)
+  - Disk-cached embeddings (JSON, invalidated on file content change)
+  - Keyword fallback via ripgrep
+  - JSON output mode for tool integration
+
+Usage:
+  engram search "how to create an auth middleware"
+  engram search "rate limiting" --chunks
+  engram search "deployment workflow" --json --root /path/to/project
+
+Configuration:
+  Reads from ENGRAM_CONFIG (default: ~/.config/engram/config.toml)
+  or falls back to built-in defaults.
+"""
+import os
+import sys
+import re
+import json
+import hashlib
+import subprocess
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration (defaults, overridden by config.toml if present)
+# ---------------------------------------------------------------------------
+OLLAMA_URL = os.environ.get(
+    "ENGRAM_OLLAMA_URL",
+    "http://127.0.0.1:11434/api/embeddings"
+)
+EMBEDDING_MODEL = os.environ.get("ENGRAM_MODEL", "nomic-embed-text")
+CHUNK_THRESHOLD = 200       # lines — files larger than this get chunk-level search
+MAX_CHUNK_CHARS = 1800      # embedding context window safety margin
+FILE_SIM_THRESHOLD = 0.18   # cosine similarity for file-level matches
+CHUNK_SIM_THRESHOLD = 0.25  # cosine similarity for chunk-level matches
+MAX_RESULTS = 5             # top N results per category
+
+
+# Advanced search settings
+TEMPORAL_DECAY = True          # weight recent files higher
+DECAY_HALF_LIFE_DAYS = 30     # score halves every N days
+CODE_BLOCK_AWARE = True        # don't split inside fenced code blocks
+
+
+def load_config():
+    """Load config from TOML file if available."""
+    global OLLAMA_URL, EMBEDDING_MODEL, CHUNK_THRESHOLD, MAX_CHUNK_CHARS
+    global FILE_SIM_THRESHOLD, CHUNK_SIM_THRESHOLD, MAX_RESULTS
+    global TEMPORAL_DECAY, DECAY_HALF_LIFE_DAYS
+
+    config_path = os.environ.get(
+        "ENGRAM_CONFIG",
+        os.path.expanduser("~/.config/engram/config.toml")
+    )
+
+    if not os.path.exists(config_path):
+        return
+
+    try:
+        # Minimal TOML parsing (no external dependency)
+        content = Path(config_path).read_text()
+        # Extract key = value pairs (handles basic TOML)
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("["):
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+
+            if key == "url":
+                OLLAMA_URL = val + "/api/embeddings" if not val.endswith("/api/embeddings") else val
+            elif key == "model":
+                EMBEDDING_MODEL = val
+            elif key == "max_chars":
+                MAX_CHUNK_CHARS = int(val)
+            elif key == "file_threshold":
+                FILE_SIM_THRESHOLD = float(val)
+            elif key == "chunk_threshold":
+                CHUNK_SIM_THRESHOLD = float(val)
+            elif key == "chunk_lines":
+                CHUNK_THRESHOLD = int(val)
+            elif key == "max_results":
+                MAX_RESULTS = int(val)
+            elif key == "temporal_decay":
+                TEMPORAL_DECAY = val.lower() in ("true", "1", "yes")
+            elif key == "decay_half_life_days":
+                DECAY_HALF_LIFE_DAYS = int(val)
+    except Exception:
+        pass  # Config is optional
+
+
+load_config()
+
+
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+def get_embedding(text: str) -> list:
+    """Get embedding vector from Ollama."""
+    if not text.strip():
+        return []
+
+    try:
+        import requests
+        resp = requests.post(
+            OLLAMA_URL,
+            json={"model": EMBEDDING_MODEL, "prompt": text[:2000]},
+            timeout=15,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        return resp.json().get("embedding", [])
+    except ImportError:
+        # Fallback: use urllib if requests not installed
+        import urllib.request
+        import urllib.error
+        data = json.dumps({"model": EMBEDDING_MODEL, "prompt": text[:2000]}).encode()
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read()).get("embedding", [])
+        except (urllib.error.URLError, OSError):
+            return []
+    except Exception:
+        return []
+
+
+def cosine_similarity(a, b):
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
+    norm_b = (sum(x * x for x in b) ** 0.5) or 1.0
+    return dot / (norm_a * norm_b)
+
+
+# ---------------------------------------------------------------------------
+# Temporal decay
+# ---------------------------------------------------------------------------
+def temporal_decay_factor(file_path: Path) -> float:
+    """
+    Calculate a decay multiplier based on file recency.
+    Returns 1.0 for today, decays exponentially with half-life.
+    """
+    if not TEMPORAL_DECAY:
+        return 1.0
+
+    import time
+    import math
+
+    try:
+        mtime = file_path.stat().st_mtime
+        age_days = (time.time() - mtime) / 86400.0
+        # Exponential decay: score * 2^(-age/half_life)
+        decay = math.pow(2, -age_days / DECAY_HALF_LIFE_DAYS)
+        return max(decay, 0.1)  # floor at 10% to never fully suppress old knowledge
+    except Exception:
+        return 1.0
+
+
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+def _is_inside_code_block(lines: list[str], line_idx: int) -> bool:
+    """Check if a line is inside a fenced code block (``` or ~~~)."""
+    if not CODE_BLOCK_AWARE:
+        return False
+
+    fence_count = 0
+    for i in range(line_idx):
+        stripped = lines[i].strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            fence_count += 1
+    return fence_count % 2 == 1  # odd = inside a block
+
+
+def chunk_file(content: str) -> list[dict]:
+    """
+    Split markdown into chunks at heading boundaries (##, ###, ####).
+    Each chunk gets parent heading context for self-contained semantics.
+    Respects fenced code blocks (won't split inside them).
+    """
+    lines = content.splitlines()
+    if len(lines) <= CHUNK_THRESHOLD:
+        return []
+
+    heading_re = re.compile(r"^(#{2,4})\s+(.+)$")
+    chunks = []
+    parents = {}
+    current_heading = ""
+    current_context = ""
+    current_lines = []
+    current_start = 0
+    in_code_block = False
+
+    for i, line in enumerate(lines):
+        # Track code fences
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+
+        m = heading_re.match(line)
+        if m and not in_code_block:
+            if current_lines:
+                text = "\n".join(current_lines).strip()
+                if text and len(text) > 40:
+                    chunks.append({
+                        "heading": current_heading,
+                        "context": current_context,
+                        "text": text,
+                        "line": current_start + 1,
+                    })
+
+            level = len(m.group(1))
+            heading_text = m.group(2).strip()
+            parents[level] = heading_text
+            for child_level in range(level + 1, 5):
+                parents.pop(child_level, None)
+
+            context_parts = [parents[pl] for pl in sorted(parents.keys()) if pl < level]
+            current_context = " > ".join(context_parts) if context_parts else ""
+            current_heading = heading_text
+            current_lines = [line]
+            current_start = i
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        text = "\n".join(current_lines).strip()
+        if text and len(text) > 40:
+            chunks.append({
+                "heading": current_heading,
+                "context": current_context,
+                "text": text,
+                "line": current_start + 1,
+            })
+
+    return chunks
+
+
+def get_embeddable_text(chunk: dict) -> str:
+    """Build the text string to embed for a chunk."""
+    parts = []
+    if chunk["context"]:
+        parts.append(chunk["context"])
+    parts.append(chunk["heading"])
+    parts.append(chunk["text"][:MAX_CHUNK_CHARS])
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Embedding cache
+# ---------------------------------------------------------------------------
+def file_hash(file_path: Path) -> str:
+    stat = file_path.stat()
+    h = hashlib.md5()
+    h.update(str(stat.st_size).encode())
+    h.update(str(stat.st_mtime_ns).encode())
+    content = file_path.read_bytes()
+    h.update(content[:4096])
+    h.update(content[-4096:])
+    return h.hexdigest()
+
+
+def _cache_dir(memory_root: Path) -> Path:
+    return memory_root / ".cache"
+
+
+def cache_path(file_path: Path, memory_root: Path) -> Path:
+    safe_name = str(file_path).replace("/", "_").replace("\\", "_")
+    return _cache_dir(memory_root) / f"{safe_name}.chunks.json"
+
+
+def load_chunk_cache(file_path: Path, memory_root: Path) -> dict | None:
+    cp = cache_path(file_path, memory_root)
+    if not cp.exists():
+        return None
+    try:
+        data = json.loads(cp.read_text())
+        if data.get("hash") == file_hash(file_path):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_chunk_cache(file_path: Path, fhash: str, chunk_data: list[dict], memory_root: Path):
+    cd = _cache_dir(memory_root)
+    cd.mkdir(parents=True, exist_ok=True)
+    cp = cache_path(file_path, memory_root)
+    cp.write_text(json.dumps({"hash": fhash, "chunks": chunk_data}))
+
+
+def get_chunk_embeddings(file_path: Path, chunks: list[dict], memory_root: Path) -> list[dict]:
+    cached = load_chunk_cache(file_path, memory_root)
+    if cached and len(cached["chunks"]) == len(chunks):
+        return cached["chunks"]
+
+    print(f"  Building chunk embeddings for {file_path.name} ({len(chunks)} chunks)...",
+          file=sys.stderr)
+
+    results = []
+    for i, chunk in enumerate(chunks):
+        emb = get_embedding(get_embeddable_text(chunk))
+        results.append({
+            "heading": chunk["heading"],
+            "context": chunk["context"],
+            "text": chunk["text"],
+            "line": chunk["line"],
+            "embedding": emb,
+        })
+        if (i + 1) % 50 == 0:
+            print(f"  ... {i + 1}/{len(chunks)} chunks embedded", file=sys.stderr)
+
+    save_chunk_cache(file_path, file_hash(file_path), results, memory_root)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# File-level embedding cache
+# ---------------------------------------------------------------------------
+def _file_cache_path(memory_root: Path) -> Path:
+    return _cache_dir(memory_root) / "_file_embeddings.json"
+
+
+def _load_file_level_cache(memory_root: Path) -> dict:
+    fcp = _file_cache_path(memory_root)
+    if fcp.exists():
+        try:
+            return json.loads(fcp.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_file_level_cache(cache: dict, memory_root: Path):
+    cd = _cache_dir(memory_root)
+    cd.mkdir(parents=True, exist_ok=True)
+    _file_cache_path(memory_root).write_text(json.dumps(cache))
+
+
+# ---------------------------------------------------------------------------
+# Qdrant-accelerated search (optional)
+# ---------------------------------------------------------------------------
+def _try_qdrant_search(query: str, query_emb: list, limit: int) -> list:
+    """Try searching Qdrant if available. Returns chunk results or empty list."""
+    try:
+        qdrant_url = os.environ.get("ENGRAM_QDRANT_URL", "http://127.0.0.1:6333")
+
+        # Quick health check
+        import urllib.request
+        import urllib.error
+        req = urllib.request.Request(f"{qdrant_url}/healthz", method="GET")
+        try:
+            urllib.request.urlopen(req, timeout=2)
+        except (urllib.error.URLError, OSError):
+            return []
+
+        # Determine collection name
+        import hashlib as _hashlib
+        cwd = os.getcwd()
+        path_hash = _hashlib.md5(cwd.encode()).hexdigest()[:12]
+        project_name = Path(cwd).name.replace(" ", "-").replace(".", "_")[:20]
+        collection = f"engram-{project_name}-{path_hash}"
+
+        # Check collection exists
+        req = urllib.request.Request(f"{qdrant_url}/collections/{collection}", method="GET")
+        try:
+            urllib.request.urlopen(req, timeout=2)
+        except urllib.error.HTTPError:
+            return []
+
+        # Search
+        search_data = json.dumps({
+            "vector": query_emb,
+            "limit": limit,
+            "with_payload": True,
+            "score_threshold": CHUNK_SIM_THRESHOLD,
+        }).encode()
+        req = urllib.request.Request(
+            f"{qdrant_url}/collections/{collection}/points/search",
+            data=search_data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+
+        chunks = []
+        for hit in result.get("result", []):
+            payload = hit.get("payload", {})
+            chunks.append({
+                "score": round(hit.get("score", 0), 4),
+                "file": payload.get("file", ""),
+                "heading": payload.get("heading", ""),
+                "context": payload.get("context", ""),
+                "line": payload.get("line", 0),
+                "text": payload.get("text", ""),
+                "source": "qdrant",
+            })
+        return chunks
+
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Core search function
+# ---------------------------------------------------------------------------
+def search(query: str, memory_root: Path, force_chunks: bool = False, limit: int = None) -> dict:
+    """
+    Search Engram memory and return structured results.
+
+    Returns:
+        {
+            "status": "ok" | "warning",
+            "query": str,
+            "chunks": [{"score", "file", "heading", "context", "line", "text"}, ...],
+            "files": [{"score", "file", "preview"}, ...],
+            "keywords": [str, ...]
+        }
+    """
+    if limit is None:
+        limit = MAX_RESULTS
+
+    result = {"status": "ok", "query": query, "chunks": [], "files": [], "keywords": []}
+
+    # Keyword search (ripgrep)
+    rg_cmd = ["rg", "--files-with-matches", "--iglob", "*.md", query, str(memory_root)]
+    try:
+        rg_out = subprocess.run(rg_cmd, capture_output=True, text=True, timeout=10)
+        result["keywords"] = [l.strip() for l in rg_out.stdout.splitlines() if l.strip()]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Collect markdown file candidates
+    candidates = []
+    for file_path in sorted(memory_root.rglob("*.md")):
+        if ".cache" in str(file_path):
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            candidates.append({
+                "path": file_path,
+                "rel_path": str(file_path.relative_to(memory_root.parent)),
+                "text": content,
+                "lines": content.count("\n"),
+            })
+        except Exception:
+            pass
+
+    if not candidates:
+        result["status"] = "warning"
+        result["message"] = "No markdown memory files found."
+        return result
+
+    # Embed query
+    query_emb = get_embedding(query)
+    if not query_emb:
+        result["status"] = "warning"
+        result["message"] = "Could not embed query (Ollama unavailable?). Keyword results only."
+        return result
+
+    # Try Qdrant first (fast path if available)
+    qdrant_results = _try_qdrant_search(query, query_emb, limit)
+    if qdrant_results:
+        result["chunks"] = qdrant_results[:limit]
+        # Still include file-level results from cache for broader context
+        # Fall through to file scoring below
+
+    # Pass 1: File-level scoring
+    file_scored = []
+    file_cache = _load_file_level_cache(memory_root)
+    file_cache_dirty = False
+
+    for cand in candidates:
+        fpath = cand["path"]
+        fhash = file_hash(fpath)
+        cache_key = cand["rel_path"]
+
+        cached = file_cache.get(cache_key)
+        if cached and cached.get("hash") == fhash:
+            text_emb = cached["embedding"]
+        else:
+            text_emb = get_embedding(cand["text"][:2000])
+            if text_emb:
+                file_cache[cache_key] = {"hash": fhash, "embedding": text_emb}
+                file_cache_dirty = True
+
+        if text_emb:
+            sim = cosine_similarity(query_emb, text_emb)
+            # Apply temporal decay — recent files score higher
+            decay = temporal_decay_factor(cand["path"])
+            adjusted_sim = sim * decay
+            if adjusted_sim > FILE_SIM_THRESHOLD:
+                file_scored.append((adjusted_sim, cand))
+
+    if file_cache_dirty:
+        _save_file_level_cache(file_cache, memory_root)
+
+    file_scored.sort(key=lambda x: -x[0])
+
+    # Pass 2: Chunk-level drill-down for top files
+    chunked_files = set()
+
+    for sim, cand in file_scored[:5]:
+        if cand["lines"] > CHUNK_THRESHOLD or force_chunks:
+            chunks = chunk_file(cand["text"])
+            if chunks:
+                chunked_files.add(cand["rel_path"])
+                chunk_embs = get_chunk_embeddings(cand["path"], chunks, memory_root)
+                for ce in chunk_embs:
+                    if ce["embedding"]:
+                        csim = cosine_similarity(query_emb, ce["embedding"])
+                        if csim > CHUNK_SIM_THRESHOLD:
+                            result["chunks"].append({
+                                "score": round(csim, 4),
+                                "file": cand["rel_path"],
+                                "heading": ce["heading"],
+                                "context": ce["context"],
+                                "line": ce["line"],
+                                "text": ce["text"],
+                            })
+
+    result["chunks"].sort(key=lambda x: -x["score"])
+    result["chunks"] = result["chunks"][:limit]
+
+    # File-level results (non-chunked files)
+    for sim, cand in file_scored:
+        if cand["rel_path"] not in chunked_files:
+            result["files"].append({
+                "score": round(sim, 4),
+                "file": cand["rel_path"],
+                "preview": cand["text"][:300].replace("\n", " ").strip(),
+            })
+    result["files"] = result["files"][:limit]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def search_global(query: str, force_chunks: bool = False, limit: int = None) -> dict:
+    """Search across all engram-initialized projects."""
+    from pathlib import Path
+    import time
+
+    if limit is None:
+        limit = MAX_RESULTS
+
+    # Find all projects with .claude/memory/
+    home = Path.home()
+    engram_home = Path(os.environ.get("ENGRAM_HOME", home / ".engram"))
+
+    # Collect memory roots from known locations
+    memory_roots = []
+
+    # Current project
+    cwd_memory = Path(".claude/memory")
+    if cwd_memory.is_dir():
+        memory_roots.append((".", cwd_memory))
+
+    # Engram pools
+    pools_dir = engram_home / "pools"
+    if pools_dir.is_dir():
+        for pool in pools_dir.iterdir():
+            if pool.is_dir() and (pool / "semantic").is_dir():
+                memory_roots.append((f"pool:{pool.name}", pool))
+
+    # Search each and merge results
+    all_chunks = []
+    all_files = []
+    all_keywords = []
+
+    for project_name, memory_root in memory_roots:
+        result = search(query, memory_root, force_chunks, limit=limit * 2)
+        for chunk in result.get("chunks", []):
+            chunk["project"] = project_name
+            all_chunks.append(chunk)
+        for f in result.get("files", []):
+            f["project"] = project_name
+            all_files.append(f)
+        all_keywords.extend(result.get("keywords", []))
+
+    # Sort by score and take top N
+    all_chunks.sort(key=lambda x: -x["score"])
+    all_files.sort(key=lambda x: -x["score"])
+
+    return {
+        "status": "ok",
+        "query": query,
+        "projects_searched": len(memory_roots),
+        "chunks": all_chunks[:limit],
+        "files": all_files[:limit],
+        "keywords": list(set(all_keywords))[:10],
+    }
+
+
+def filter_by_date(result: dict, since: str) -> dict:
+    """Filter search results to only include files modified after a date."""
+    import time
+    from datetime import datetime
+
+    # Parse date string
+    try:
+        if since == "today":
+            cutoff = datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+        elif since == "yesterday":
+            cutoff = (datetime.now().replace(hour=0, minute=0, second=0).timestamp() - 86400)
+        elif since.startswith("-"):
+            days = int(since[1:])
+            cutoff = time.time() - (days * 86400)
+        else:
+            cutoff = datetime.strptime(since, "%Y-%m-%d").timestamp()
+    except (ValueError, TypeError):
+        return result  # Can't parse, return unfiltered
+
+    # Filter chunks by file mtime
+    filtered_chunks = []
+    for chunk in result.get("chunks", []):
+        file_path = Path(chunk["file"])
+        try:
+            if file_path.exists() and file_path.stat().st_mtime >= cutoff:
+                filtered_chunks.append(chunk)
+        except Exception:
+            filtered_chunks.append(chunk)  # Keep if can't check
+
+    filtered_files = []
+    for f in result.get("files", []):
+        file_path = Path(f["file"])
+        try:
+            if file_path.exists() and file_path.stat().st_mtime >= cutoff:
+                filtered_files.append(f)
+        except Exception:
+            filtered_files.append(f)
+
+    result["chunks"] = filtered_chunks
+    result["files"] = filtered_files
+    return result
+
+
+def main():
+    query = ""
+    force_chunks = False
+    json_mode = False
+    global_mode = False
+    since = None
+    root = None
+
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--chunks":
+            force_chunks = True
+        elif args[i] == "--json":
+            json_mode = True
+        elif args[i] == "--global":
+            global_mode = True
+        elif args[i] == "--since":
+            i += 1
+            if i < len(args):
+                since = args[i]
+        elif args[i] == "--root":
+            i += 1
+            if i < len(args):
+                root = args[i]
+        elif not query:
+            query = args[i]
+        i += 1
+
+    if not query:
+        print("Usage: engram search \"your query\" [--chunks] [--json] [--global] [--since DATE]")
+        print("")
+        print("Options:")
+        print("  --chunks    Force chunk-level search even for small files")
+        print("  --json      Output as JSON")
+        print("  --global    Search across all projects and pools")
+        print("  --since X   Filter to files modified after date (YYYY-MM-DD, today, -7)")
+        return
+
+    if global_mode:
+        result = search_global(query, force_chunks)
+    else:
+        memory_root = Path(root) / ".claude" / "memory" if root else Path(".claude/memory")
+        if not memory_root.is_dir():
+            print(f"Error: {memory_root} not found. Run 'engram init' first.", file=sys.stderr)
+            sys.exit(1)
+        result = search(query, memory_root, force_chunks)
+
+    # Apply date filter
+    if since:
+        result = filter_by_date(result, since)
+
+    if json_mode:
+        print(json.dumps(result, indent=2))
+        return
+
+    # Human-readable output
+    if global_mode and result.get("projects_searched"):
+        print(f"Searching {result['projects_searched']} project(s) for: '{query}'")
+    else:
+        print(f"Searching memory for: '{query}'")
+
+    if result.get("message"):
+        print(result["message"])
+
+    if result["chunks"]:
+        print(f"\nTop chunk matches:")
+        for idx, ch in enumerate(result["chunks"], 1):
+            ctx = f" ({ch['context']})" if ch["context"] else ""
+            project = f" [{ch['project']}]" if ch.get("project") else ""
+            print(f"\n{idx}. [{ch['score']:.3f}]{project} {ch['file']} :: {ch['heading']}{ctx}")
+            print(f"   Line {ch['line']}")
+            preview_lines = ch["text"].splitlines()
+            preview = []
+            char_count = 0
+            for pl in preview_lines:
+                if char_count + len(pl) > 500:
+                    break
+                preview.append(f"   {pl}")
+                char_count += len(pl)
+            print("\n".join(preview))
+
+    if result["files"]:
+        print(f"\nFile-level matches:")
+        for idx, f in enumerate(result["files"], 1):
+            project = f" [{f['project']}]" if f.get("project") else ""
+            print(f"{idx}. [{f['score']:.3f}]{project} {f['file']}\n   {f['preview'][:280]}...\n")
+
+    if result["keywords"]:
+        print("\nKeyword matches (ripgrep):")
+        print("\n".join(f"- {f}" for f in result["keywords"][:5]))
+
+
+if __name__ == "__main__":
+    main()

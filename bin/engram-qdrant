@@ -1,0 +1,232 @@
+#!/bin/bash
+# Engram Qdrant Manager — download, start, stop the Qdrant binary.
+#
+# Usage:
+#   engram qdrant download     # download binary for current platform
+#   engram qdrant start        # start Qdrant in background
+#   engram qdrant stop         # stop Qdrant
+#   engram qdrant status       # check if running
+#
+# Qdrant is stored at: ~/.engram/qdrant/
+# Data stored at: ~/.engram/qdrant_data/
+
+set -euo pipefail
+
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+QDRANT_DIR="$ENGRAM_HOME/qdrant"
+QDRANT_BIN="$QDRANT_DIR/qdrant"
+QDRANT_DATA="$ENGRAM_HOME/qdrant_data"
+QDRANT_PID_FILE="$QDRANT_DIR/.pid"
+QDRANT_PORT="${ENGRAM_QDRANT_PORT:-6333}"
+QDRANT_VERSION="${ENGRAM_QDRANT_VERSION:-v1.12.1}"
+
+usage() {
+  cat << 'EOF'
+Engram Qdrant Manager
+
+Usage:
+  engram qdrant download     Download Qdrant binary for current platform
+  engram qdrant start        Start Qdrant in background
+  engram qdrant stop         Stop Qdrant
+  engram qdrant status       Check if running
+  engram qdrant logs         Show recent logs
+
+Qdrant binary: ~/.engram/qdrant/qdrant
+Qdrant data:   ~/.engram/qdrant_data/
+EOF
+}
+
+detect_platform() {
+  local os arch
+
+  case "$(uname -s)" in
+    Linux)  os="linux" ;;
+    Darwin) os="macos" ;;
+    *)      echo "Unsupported OS: $(uname -s)"; exit 1 ;;
+  esac
+
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *)            echo "Unsupported arch: $(uname -m)"; exit 1 ;;
+  esac
+
+  # Qdrant release naming: qdrant-x86_64-unknown-linux-gnu.tar.gz
+  if [ "$os" = "linux" ]; then
+    echo "qdrant-${arch}-unknown-linux-gnu"
+  else
+    echo "qdrant-${arch}-apple-darwin"
+  fi
+}
+
+cmd_download() {
+  local platform
+  platform=$(detect_platform)
+  local url="https://github.com/qdrant/qdrant/releases/download/${QDRANT_VERSION}/${platform}.tar.gz"
+
+  mkdir -p "$QDRANT_DIR"
+
+  echo "Downloading Qdrant ${QDRANT_VERSION}..."
+  echo "  Platform: $platform"
+  echo "  URL: $url"
+  echo ""
+
+  # Download and extract
+  curl -sSL "$url" | tar -xz -C "$QDRANT_DIR"
+
+  if [ -f "$QDRANT_BIN" ]; then
+    chmod +x "$QDRANT_BIN"
+    echo "Installed: $QDRANT_BIN"
+    echo ""
+    "$QDRANT_BIN" --version 2>/dev/null || echo "(binary ready)"
+  else
+    # Some releases put it in a subdirectory
+    local found
+    found=$(find "$QDRANT_DIR" -name "qdrant" -type f | head -1)
+    if [ -n "$found" ]; then
+      mv "$found" "$QDRANT_BIN"
+      chmod +x "$QDRANT_BIN"
+      echo "Installed: $QDRANT_BIN"
+    else
+      echo "Error: qdrant binary not found after extraction."
+      echo "Contents of $QDRANT_DIR:"
+      ls -la "$QDRANT_DIR"
+      exit 1
+    fi
+  fi
+
+  echo ""
+  echo "Next: engram qdrant start"
+}
+
+cmd_start() {
+  if is_running; then
+    echo "Qdrant already running (PID $(cat "$QDRANT_PID_FILE"))"
+    return 0
+  fi
+
+  if [ ! -f "$QDRANT_BIN" ]; then
+    echo "Qdrant not installed. Run: engram qdrant download"
+    exit 1
+  fi
+
+  mkdir -p "$QDRANT_DATA"
+  local log_file="$QDRANT_DIR/qdrant.log"
+
+  echo "Starting Qdrant on port $QDRANT_PORT..."
+
+  "$QDRANT_BIN" \
+    --storage-path "$QDRANT_DATA" \
+    --http-port "$QDRANT_PORT" \
+    > "$log_file" 2>&1 &
+
+  local pid=$!
+  echo "$pid" > "$QDRANT_PID_FILE"
+
+  # Wait for health
+  local attempts=0
+  while [ $attempts -lt 20 ]; do
+    if curl -s "http://127.0.0.1:${QDRANT_PORT}/healthz" >/dev/null 2>&1; then
+      echo "Qdrant running (PID $pid, port $QDRANT_PORT)"
+      echo "Data: $QDRANT_DATA"
+      return 0
+    fi
+    sleep 0.5
+    attempts=$((attempts + 1))
+  done
+
+  echo "Warning: Qdrant started but health check failed after 10s"
+  echo "Check logs: engram qdrant logs"
+}
+
+cmd_stop() {
+  if [ -f "$QDRANT_PID_FILE" ]; then
+    local pid
+    pid=$(cat "$QDRANT_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      echo "Qdrant stopped (PID $pid)"
+    else
+      echo "Qdrant not running (stale PID file)"
+    fi
+    rm -f "$QDRANT_PID_FILE"
+  else
+    # Try to find by port
+    local pid
+    pid=$(lsof -ti :"$QDRANT_PORT" 2>/dev/null | head -1) || true
+    if [ -n "$pid" ]; then
+      kill "$pid"
+      echo "Qdrant stopped (PID $pid)"
+    else
+      echo "Qdrant not running"
+    fi
+  fi
+}
+
+cmd_status() {
+  if is_running; then
+    local pid
+    pid=$(cat "$QDRANT_PID_FILE" 2>/dev/null || echo "?")
+    echo "Qdrant: running (PID $pid, port $QDRANT_PORT)"
+
+    # Show collections
+    local resp
+    resp=$(curl -s "http://127.0.0.1:${QDRANT_PORT}/collections" 2>/dev/null) || true
+    if [ -n "$resp" ]; then
+      local count
+      count=$(echo "$resp" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('result',{}).get('collections',[])))" 2>/dev/null || echo "?")
+      echo "Collections: $count"
+    fi
+
+    # Show data size
+    if [ -d "$QDRANT_DATA" ]; then
+      local size
+      size=$(du -sh "$QDRANT_DATA" 2>/dev/null | cut -f1)
+      echo "Data size: $size"
+    fi
+  else
+    echo "Qdrant: not running"
+    if [ -f "$QDRANT_BIN" ]; then
+      echo "Binary: $QDRANT_BIN (installed)"
+      echo "Start with: engram qdrant start"
+    else
+      echo "Binary: not installed"
+      echo "Install with: engram qdrant download"
+    fi
+  fi
+}
+
+cmd_logs() {
+  local log_file="$QDRANT_DIR/qdrant.log"
+  if [ -f "$log_file" ]; then
+    tail -50 "$log_file"
+  else
+    echo "No log file found at $log_file"
+  fi
+}
+
+is_running() {
+  if [ -f "$QDRANT_PID_FILE" ]; then
+    local pid
+    pid=$(cat "$QDRANT_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  # Check by port
+  curl -s "http://127.0.0.1:${QDRANT_PORT}/healthz" >/dev/null 2>&1
+}
+
+case "${1:-}" in
+  download)  cmd_download ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  status)    cmd_status ;;
+  logs)      cmd_logs ;;
+  help|--help|-h|"")  usage ;;
+  *)
+    echo "Unknown command: $1"
+    usage
+    exit 1
+    ;;
+esac

@@ -1,0 +1,195 @@
+#!/bin/bash
+# Engram — Initialize 5-layer memory system in any project.
+#
+# Usage:
+#   engram init [project-dir] [--template <name>]
+#
+# Creates:
+#   .claude/memory/{active,semantic,procedural,lossless}/
+#   .claude/scripts/engram-* (symlinks to global install)
+#   Appends Engram protocol to CLAUDE.md (if not present)
+#
+# Templates:
+#   --template <name>   Seed with domain knowledge from templates/<name>/
+#
+# Dependencies (optional):
+#   - Ollama with nomic-embed-text model (for semantic search)
+#   - ripgrep (for keyword search fallback)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+
+# Parse args
+TEMPLATE=""
+PROJECT_DIR="."
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --template)
+      TEMPLATE="$2"
+      shift 2
+      ;;
+    --template=*)
+      TEMPLATE="${1#*=}"
+      shift
+      ;;
+    *)
+      PROJECT_DIR="$1"
+      shift
+      ;;
+  esac
+done
+
+cd "$PROJECT_DIR"
+
+echo "Engram: initializing 5-layer memory in $(pwd)"
+
+# 1. Create directory structure
+mkdir -p .claude/memory/active
+mkdir -p .claude/memory/semantic
+mkdir -p .claude/memory/procedural
+mkdir -p .claude/memory/lossless
+mkdir -p .claude/scripts
+
+echo "  Created .claude/memory/{active,semantic,procedural,lossless}/"
+
+# 2. Seed active layer files
+if [ ! -f .claude/memory/active/current-tasks.md ]; then
+  cat > .claude/memory/active/current-tasks.md << 'SEED'
+# Current Tasks
+
+_No active tasks yet. Update this file as you work._
+SEED
+  echo "  Seeded active/current-tasks.md"
+fi
+
+if [ ! -f .claude/memory/active/context-inject.md ]; then
+  echo "# Context Inject — auto-populated by engram start" > .claude/memory/active/context-inject.md
+  echo "  Seeded active/context-inject.md"
+fi
+
+# 3. Symlink scripts to global install
+for script in engram-start engram-end engram-search engram-sync engram-status; do
+  if [ -f "$SCRIPT_DIR/$script" ]; then
+    ln -sf "$SCRIPT_DIR/$script" ".claude/scripts/$script"
+  fi
+done
+echo "  Symlinked scripts → $(dirname "$SCRIPT_DIR")"
+
+# 4. Template seeding
+if [ -n "$TEMPLATE" ]; then
+  # Look for template in: ENGRAM_HOME/templates/, then repo templates/
+  TEMPLATE_DIR=""
+  for candidate in "$ENGRAM_HOME/templates/$TEMPLATE" "$SCRIPT_DIR/../templates/$TEMPLATE"; do
+    if [ -d "$candidate" ]; then
+      TEMPLATE_DIR="$(cd "$candidate" && pwd)"
+      break
+    fi
+  done
+
+  if [ -z "$TEMPLATE_DIR" ]; then
+    echo "  WARNING: template '$TEMPLATE' not found."
+    echo "  Searched: $ENGRAM_HOME/templates/$TEMPLATE"
+    echo "           $SCRIPT_DIR/../templates/$TEMPLATE"
+  else
+    echo ""
+    echo "  Seeding template: $TEMPLATE ($TEMPLATE_DIR)"
+
+    for layer in semantic procedural; do
+      if [ -d "$TEMPLATE_DIR/$layer" ]; then
+        for f in "$TEMPLATE_DIR/$layer/"*; do
+          [ -f "$f" ] || continue
+          fname=$(basename "$f")
+          if [ ! -f ".claude/memory/$layer/$fname" ]; then
+            cp "$f" ".claude/memory/$layer/$fname"
+            echo "    $layer/$fname"
+          else
+            echo "    $layer/$fname (exists, skipped)"
+          fi
+        done
+      fi
+    done
+
+    echo "  Template '$TEMPLATE' seeded!"
+  fi
+fi
+
+# 5. Add .gitignore for cache
+if [ ! -f .claude/memory/.gitignore ]; then
+  cat > .claude/memory/.gitignore << 'GI'
+.cache/
+GI
+fi
+
+# 6. Add memory protocol to CLAUDE.md if not present
+PROTOCOL_MARKER="## Engram"
+if [ ! -f CLAUDE.md ]; then
+  cat > CLAUDE.md << 'CLAUDEMD'
+# Project — Claude Code Reference
+
+## Engram — 5-Layer Memory System
+
+You have a 5-layer memory system in `.claude/memory/`:
+
+| Layer | Path | Purpose |
+|-------|------|---------|
+| 1. Core Identity | `CLAUDE.md` | Permanent rules, always active |
+| 2. Lossless | `memory/lossless/` | Raw session transcripts (append-only) |
+| 3. Semantic | `memory/semantic/` | Distilled facts, searchable knowledge |
+| 4. Procedural | `memory/procedural/` | Workflows, standards, how-tos |
+| 5. Active | `memory/active/` | Today's tasks, context, blockers |
+
+**Retrieval priority**: Active → Semantic → Procedural → Lossless
+
+**Session workflow**:
+- Start: `engram start "topic"` (or `bash .claude/scripts/engram-start "topic"`)
+- Every 30 min: `engram end "summary"` (MANDATORY checkpoint)
+- Search: `engram search "query"`
+
+**Update rules**:
+- After every 3-4 tool calls: update `active/current-tasks.md`
+- After solving a problem: distill learnings → `semantic/`
+- After documenting a workflow: write to `procedural/`
+- Never delete memory files — supersede or append with dates
+CLAUDEMD
+  echo "  Created CLAUDE.md with Engram protocol"
+elif ! grep -q "$PROTOCOL_MARKER" CLAUDE.md; then
+  cat >> CLAUDE.md << 'APPEND'
+
+## Engram — 5-Layer Memory System
+
+You have a 5-layer memory system in `.claude/memory/`:
+
+| Layer | Path | Purpose |
+|-------|------|---------|
+| 1. Core Identity | `CLAUDE.md` | Permanent rules, always active |
+| 2. Lossless | `memory/lossless/` | Raw session transcripts (append-only) |
+| 3. Semantic | `memory/semantic/` | Distilled facts, searchable knowledge |
+| 4. Procedural | `memory/procedural/` | Workflows, standards, how-tos |
+| 5. Active | `memory/active/` | Today's tasks, context, blockers |
+
+**Retrieval priority**: Active → Semantic → Procedural → Lossless
+
+**Session workflow**:
+- Start: `engram start "topic"` (or `bash .claude/scripts/engram-start "topic"`)
+- Every 30 min: `engram end "summary"` (MANDATORY checkpoint)
+- Search: `engram search "query"`
+
+**Update rules**:
+- After every 3-4 tool calls: update `active/current-tasks.md`
+- After solving a problem: distill learnings → `semantic/`
+- After documenting a workflow: write to `procedural/`
+- Never delete memory files — supersede or append with dates
+APPEND
+  echo "  Appended Engram protocol to CLAUDE.md"
+else
+  echo "  CLAUDE.md already has Engram protocol — skipped"
+fi
+
+echo ""
+echo "Engram initialized! Next steps:"
+echo "  engram start \"your topic here\""
+echo ""
+echo "Optional: install Ollama + nomic-embed-text for semantic search:"
+echo "  ollama pull nomic-embed-text"

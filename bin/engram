@@ -1,0 +1,110 @@
+#!/bin/bash
+# Engram CLI — unified entry point for the 5-layer memory system.
+#
+# Usage:
+#   engram init [path] [--template <name>]
+#   engram start "topic"
+#   engram end "summary"
+#   engram search "query" [--chunks] [--json]
+#   engram sync <source> <target> [--dry-run] [--all]
+#   engram status
+#   engram version
+#
+# Environment:
+#   ENGRAM_HOME     — where engram is installed (default: ~/.engram)
+#   ENGRAM_CONFIG   — path to config.toml (default: ~/.config/engram/config.toml)
+
+set -euo pipefail
+
+VERSION="0.1.0"
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+ENGRAM_CONFIG="${ENGRAM_CONFIG:-$HOME/.config/engram/config.toml}"
+
+# Resolve the actual script directory (follow symlinks)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+BIN_DIR="$SCRIPT_DIR"
+
+usage() {
+  cat << 'EOF'
+Engram — Persistent 5-layer memory for Claude Code
+
+Usage:
+  engram init [path] [--template <name>]   Initialize memory in a project
+  engram start "topic"                     Load context at session start
+  engram end "summary"                     Write lossless checkpoint
+  engram search "query" [--chunks] [--json] Search memory (semantic + keyword)
+  engram sync <source> <target> [opts]     Sync knowledge between locations
+  engram index [--incremental] [--status]  Build/update Qdrant vector index
+  engram qdrant <download|start|stop>      Manage Qdrant binary
+  engram hooks <install|remove|status>     Manage Claude Code hooks
+  engram template <create|list|install>    Manage knowledge templates
+  engram status                            Show memory layer stats
+  engram version                           Print version
+
+Options:
+  --template <name>    Use a template when initializing (e.g., d365, react)
+  --chunks             Force chunk-level search even for small files
+  --json               Output search results as JSON
+  --dry-run            Preview sync without making changes
+  --all                Sync all layers (including lossless/active)
+  --incremental        Only index new/changed files
+
+Environment:
+  ENGRAM_HOME          Installation directory (default: ~/.engram)
+  ENGRAM_CONFIG        Config file path (default: ~/.config/engram/config.toml)
+EOF
+}
+
+case "${1:-}" in
+  init)
+    shift
+    exec "$BIN_DIR/engram-init" "$@"
+    ;;
+  start)
+    shift
+    exec "$BIN_DIR/engram-start" "$@"
+    ;;
+  end)
+    shift
+    exec "$BIN_DIR/engram-end" "$@"
+    ;;
+  search)
+    shift
+    exec python3 "$BIN_DIR/engram-search" "$@"
+    ;;
+  sync)
+    shift
+    exec python3 "$BIN_DIR/engram-sync" "$@"
+    ;;
+  index)
+    shift
+    exec python3 "$BIN_DIR/engram-index" "$@"
+    ;;
+  qdrant)
+    shift
+    exec "$BIN_DIR/engram-qdrant" "$@"
+    ;;
+  status)
+    shift
+    exec "$BIN_DIR/engram-status" "$@"
+    ;;
+  hooks)
+    shift
+    exec "$BIN_DIR/engram-hooks" "$@"
+    ;;
+  template)
+    shift
+    exec "$BIN_DIR/engram-template" "$@"
+    ;;
+  version|--version|-v)
+    echo "engram $VERSION"
+    ;;
+  help|--help|-h|"")
+    usage
+    ;;
+  *)
+    echo "engram: unknown command '$1'"
+    echo "Run 'engram help' for usage."
+    exit 1
+    ;;
+esac

@@ -1,0 +1,85 @@
+#!/bin/bash
+# Engram — Write lossless session checkpoint.
+#
+# Usage: engram end "summary of what was done"
+#
+# Run this every ~30 minutes during active work. Each call creates a
+# self-contained chunk in lossless/ with:
+#   - Timestamp and summary
+#   - Snapshot of current tasks
+#   - List of memory files modified since last chunk
+#
+# Chunks are immutable after creation (append-only layer).
+
+set -euo pipefail
+
+DATE=$(date +%Y-%m-%d)
+TIME=$(date +%H:%M)
+TIMESTAMP=$(date +%Y-%m-%d_%H%M)
+SUMMARY="${*:-Session checkpoint (no summary provided)}"
+
+MEMORY_ROOT=".claude/memory"
+LOSSLESS_DIR="$MEMORY_ROOT/lossless"
+LOSSLESS_FILE="$LOSSLESS_DIR/${TIMESTAMP}.md"
+TASKS_FILE="$MEMORY_ROOT/active/current-tasks.md"
+
+if [ ! -d "$MEMORY_ROOT" ]; then
+  echo "Error: $MEMORY_ROOT not found. Run 'engram init' first."
+  exit 1
+fi
+
+mkdir -p "$LOSSLESS_DIR"
+
+# Find most recent previous chunk for change detection
+LAST_CHUNK=$(find "$LOSSLESS_DIR" -name "*.md" -type f 2>/dev/null | sort | tail -1)
+
+# Build the chunk
+{
+  echo "# Lossless Chunk — $DATE $TIME"
+  echo ""
+  echo "## $SUMMARY"
+  echo ""
+
+  # Snapshot of current tasks
+  if [ -f "$TASKS_FILE" ]; then
+    echo "### Tasks Snapshot"
+    echo ""
+    cat "$TASKS_FILE"
+    echo ""
+  fi
+
+  # Files modified since last chunk
+  CHANGED=""
+  for layer in semantic procedural active; do
+    layer_dir="$MEMORY_ROOT/$layer"
+    if [ -d "$layer_dir" ]; then
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        rel=$(echo "$f" | sed "s|$MEMORY_ROOT/||")
+        CHANGED="${CHANGED}- ${rel}\n"
+      done < <(
+        if [ -n "${LAST_CHUNK:-}" ]; then
+          find "$layer_dir" -name "*.md" -newer "$LAST_CHUNK" -type f 2>/dev/null || true
+        else
+          find "$layer_dir" -name "*.md" -type f 2>/dev/null || true
+        fi
+      )
+    fi
+  done
+
+  if [ -n "$CHANGED" ]; then
+    echo "### Memory Changed Since Last Chunk"
+    echo ""
+    echo -e "$CHANGED"
+  fi
+
+} > "$LOSSLESS_FILE"
+
+echo "Lossless chunk written: $LOSSLESS_FILE"
+
+# Auto-index into Qdrant if available (background, non-blocking)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if curl -s -o /dev/null "http://127.0.0.1:6333/healthz" 2>/dev/null; then
+  python3 "$SCRIPT_DIR/engram-index" --incremental >/dev/null 2>&1 &
+  echo "Background: updating Qdrant index"
+fi

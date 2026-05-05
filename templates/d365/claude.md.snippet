@@ -1,0 +1,33 @@
+## Engram — 5-Layer Memory System
+
+You have a 5-layer memory system in `.claude/memory/`:
+
+| Layer | Path | Purpose |
+|-------|------|---------|
+| 1. Core Identity | `CLAUDE.md` | Permanent rules, always active |
+| 2. Lossless | `memory/lossless/` | Raw session transcripts (append-only) |
+| 3. Semantic | `memory/semantic/` | Distilled facts, searchable knowledge |
+| 4. Procedural | `memory/procedural/` | Workflows, standards, how-tos |
+| 5. Active | `memory/active/` | Today's tasks, context, blockers |
+
+**Retrieval priority**: Active → Semantic → Procedural → Lossless
+
+**Session workflow**:
+- Start: `engram start "topic"`
+- Every 30 min: `engram end "summary"` (MANDATORY checkpoint)
+- Search: `engram search "query"`
+
+**Update rules**:
+- After every 3-4 tool calls: update `active/current-tasks.md`
+- After solving a problem: distill learnings → `semantic/`
+- After documenting a workflow: write to `procedural/`
+- Never delete memory files — supersede or append with dates
+
+## D365 Shared Knowledge
+
+This project uses shared D365 F&O knowledge from the `d365` template.
+
+**When you learn something transferable about D365 F&O:**
+1. Update `semantic/` or `procedural/` in this project
+2. Use `engram sync . ~/.engram/pools/d365` to push back to the shared pool
+3. Keep project-specific details out — use placeholders like `<COMPANY>`, `<ENTITY>`
