@@ -52,7 +52,18 @@ cmd_install() {
 # This runs as a PostToolUse hook. Claude Code passes tool info via env vars.
 
 COUNTER_FILE="/tmp/engram-hook-counter-$$"
-CHECKPOINT_INTERVAL="${ENGRAM_CHECKPOINT_INTERVAL:-20}"
+# Read interval from config.toml if available
+ENGRAM_CONFIG="${ENGRAM_CONFIG:-$HOME/.config/engram/config.toml}"
+if [ -f "$ENGRAM_CONFIG" ] && [ -z "${ENGRAM_CHECKPOINT_INTERVAL:-}" ]; then
+  _interval=$(grep "^checkpoint_interval" "$ENGRAM_CONFIG" 2>/dev/null | head -1 | sed 's/.*= *//' | tr -d '"' || echo "")
+  if [ -n "$_interval" ]; then
+    CHECKPOINT_INTERVAL="$_interval"
+  else
+    CHECKPOINT_INTERVAL=20
+  fi
+else
+  CHECKPOINT_INTERVAL="${ENGRAM_CHECKPOINT_INTERVAL:-20}"
+fi
 
 # Initialize or read counter
 if [ -f "$COUNTER_FILE" ]; then

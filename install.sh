@@ -36,7 +36,7 @@ fi
 
 # 1. Install scripts
 mkdir -p "$BIN_DIR"
-for script in engram engram-init engram-start engram-end engram-search engram-sync engram-status engram-index engram-qdrant engram-hooks engram-template engram-export engram-import engram-setup engram-lint engram-compound engram-xref; do
+for script in engram engram-init engram-start engram-end engram-search engram-sync engram-status engram-index engram-qdrant engram-hooks engram-template engram-export engram-import engram-setup engram-lint engram-compound engram-xref engram-recall engram-similar engram-lock engram-agent engram-web engram-export-obsidian engram-pii engram-diff engram-forget engram-compact; do
   if [ -f "$SOURCE_DIR/bin/$script" ]; then
     cp "$SOURCE_DIR/bin/$script" "$BIN_DIR/$script"
     chmod +x "$BIN_DIR/$script"
@@ -70,19 +70,36 @@ mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
   cat > "$CONFIG_DIR/config.toml" << 'TOML'
 # Engram configuration
-# See: https://github.com/YOUR_USER/engram#configuration
+# See: https://github.com/grynn-in/engram#configuration
 
 [embedding]
 provider = "ollama"
 model = "nomic-embed-text"
 url = "http://127.0.0.1:11434"
 max_chars = 1800
+# provider options: ollama, openai, cohere
 
 [search]
 file_threshold = 0.18
 chunk_threshold = 0.25
 chunk_lines = 200
 max_results = 5
+
+[temporal]
+decay = true
+decay_half_life_days = 30
+
+[vector_db]
+enabled = false
+provider = "qdrant"
+url = "http://127.0.0.1:6333"
+auto_index = true
+hybrid_search = true
+
+[hooks]
+auto_checkpoint = true
+checkpoint_interval = 20
+session_end_checkpoint = true
 
 [session]
 checkpoint_minutes = 30

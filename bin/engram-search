@@ -147,6 +147,56 @@ def cosine_similarity(a, b):
 
 
 # ---------------------------------------------------------------------------
+# Quality scoring
+# ---------------------------------------------------------------------------
+def quality_score(text: str, file_path: Path) -> float:
+    """
+    Calculate a quality multiplier based on content characteristics.
+
+    Quality factors:
+    - Length bonus: chunks > 200 chars get +10%, > 500 chars get +20%
+    - Structure bonus: has headings (+5%), has code blocks (+10%), has lists (+5%)
+    - Layer bonus: semantic (+10%), procedural (+5%), active (0%), lossless (-10%)
+
+    Returns a multiplier (typically 0.9 to 1.4).
+    """
+    multiplier = 1.0
+
+    # Length bonus
+    text_len = len(text)
+    if text_len > 500:
+        multiplier += 0.20
+    elif text_len > 200:
+        multiplier += 0.10
+
+    # Structure bonus — headings
+    if re.search(r'^#{1,4}\s+', text, re.MULTILINE):
+        multiplier += 0.05
+
+    # Structure bonus — code blocks
+    if '```' in text or '~~~' in text:
+        multiplier += 0.10
+
+    # Structure bonus — lists (- or * or numbered)
+    if re.search(r'^\s*[-*]\s+', text, re.MULTILINE) or \
+       re.search(r'^\s*\d+[.)]\s+', text, re.MULTILINE):
+        multiplier += 0.05
+
+    # Layer bonus — determine from file path
+    path_str = str(file_path)
+    if '/semantic/' in path_str:
+        multiplier += 0.10
+    elif '/procedural/' in path_str:
+        multiplier += 0.05
+    elif '/active/' in path_str:
+        pass  # 0% bonus
+    elif '/lossless/' in path_str:
+        multiplier -= 0.10
+
+    return multiplier
+
+
+# ---------------------------------------------------------------------------
 # Temporal decay
 # ---------------------------------------------------------------------------
 def temporal_decay_factor(file_path: Path) -> float:
@@ -354,6 +404,9 @@ def _save_file_level_cache(cache: dict, memory_root: Path):
 # ---------------------------------------------------------------------------
 # Qdrant-accelerated search (optional)
 # ---------------------------------------------------------------------------
+HYBRID_SEARCH = True  # Use BM25+vector fusion when Qdrant available
+
+
 def _try_qdrant_search(query: str, query_emb: list, limit: int) -> list:
     """Try searching Qdrant if available. Returns chunk results or empty list."""
     try:
@@ -382,7 +435,11 @@ def _try_qdrant_search(query: str, query_emb: list, limit: int) -> list:
         except urllib.error.HTTPError:
             return []
 
-        # Search
+        # Use hybrid search (BM25 + vector) if enabled
+        if HYBRID_SEARCH:
+            return _qdrant_hybrid_search(qdrant_url, collection, query, query_emb, limit)
+
+        # Pure vector search fallback
         search_data = json.dumps({
             "vector": query_emb,
             "limit": limit,
@@ -414,6 +471,95 @@ def _try_qdrant_search(query: str, query_emb: list, limit: int) -> list:
 
     except Exception:
         return []
+
+
+def _qdrant_hybrid_search(qdrant_url: str, collection: str, query: str, query_emb: list, limit: int) -> list:
+    """Hybrid BM25 + vector search via Qdrant with RRF fusion."""
+    import urllib.request
+
+    # 1. Vector search
+    search_data = json.dumps({
+        "vector": query_emb,
+        "limit": limit * 2,
+        "with_payload": True,
+        "score_threshold": CHUNK_SIM_THRESHOLD * 0.8,  # slightly lower for fusion
+    }).encode()
+    req = urllib.request.Request(
+        f"{qdrant_url}/collections/{collection}/points/search",
+        data=search_data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        vector_result = json.loads(resp.read().decode())
+    vector_hits = vector_result.get("result", [])
+
+    # 2. Keyword search (BM25 approximation via payload text matching)
+    keywords = [w.lower() for w in query.split() if len(w) > 2]
+    keyword_hits = []
+    for keyword in keywords[:3]:
+        try:
+            scroll_data = json.dumps({
+                "limit": limit,
+                "with_payload": True,
+                "filter": {
+                    "should": [
+                        {"key": "text", "match": {"text": keyword}},
+                        {"key": "heading", "match": {"text": keyword}},
+                    ]
+                }
+            }).encode()
+            req = urllib.request.Request(
+                f"{qdrant_url}/collections/{collection}/points/scroll",
+                data=scroll_data,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                scroll_result = json.loads(resp.read().decode())
+            points = scroll_result.get("result", {}).get("points", [])
+            keyword_hits.extend(points)
+        except Exception:
+            continue
+
+    # 3. RRF fusion (k=60 standard)
+    K = 60
+    scores = {}
+    for rank, hit in enumerate(vector_hits):
+        pid = hit.get("id")
+        rrf = 1.0 / (K + rank + 1)
+        if pid not in scores:
+            scores[pid] = {"payload": hit.get("payload", {}), "score": 0.0}
+        scores[pid]["score"] += rrf
+
+    # Deduplicate keyword hits
+    kw_seen = {}
+    for hit in keyword_hits:
+        pid = hit.get("id")
+        if pid not in kw_seen:
+            kw_seen[pid] = hit
+
+    for rank, (pid, hit) in enumerate(kw_seen.items()):
+        rrf = 1.0 / (K + rank + 1)
+        if pid not in scores:
+            scores[pid] = {"payload": hit.get("payload", {}), "score": 0.0}
+        scores[pid]["score"] += rrf
+
+    # Sort and format
+    fused = sorted(scores.values(), key=lambda x: -x["score"])[:limit]
+    chunks = []
+    for item in fused:
+        payload = item["payload"]
+        chunks.append({
+            "score": round(item["score"], 4),
+            "file": payload.get("file", ""),
+            "heading": payload.get("heading", ""),
+            "context": payload.get("context", ""),
+            "line": payload.get("line", 0),
+            "text": payload.get("text", ""),
+            "source": "qdrant-hybrid",
+        })
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +649,9 @@ def search(query: str, memory_root: Path, force_chunks: bool = False, limit: int
             sim = cosine_similarity(query_emb, text_emb)
             # Apply temporal decay — recent files score higher
             decay = temporal_decay_factor(cand["path"])
-            adjusted_sim = sim * decay
+            # Apply quality scoring — well-structured content scores higher
+            quality = quality_score(cand["text"], cand["path"])
+            adjusted_sim = sim * decay * quality
             if adjusted_sim > FILE_SIM_THRESHOLD:
                 file_scored.append((adjusted_sim, cand))
 
@@ -524,9 +672,12 @@ def search(query: str, memory_root: Path, force_chunks: bool = False, limit: int
                 for ce in chunk_embs:
                     if ce["embedding"]:
                         csim = cosine_similarity(query_emb, ce["embedding"])
-                        if csim > CHUNK_SIM_THRESHOLD:
+                        # Apply quality scoring to chunk text
+                        chunk_quality = quality_score(ce["text"], cand["path"])
+                        adjusted_csim = csim * chunk_quality
+                        if adjusted_csim > CHUNK_SIM_THRESHOLD:
                             result["chunks"].append({
-                                "score": round(csim, 4),
+                                "score": round(adjusted_csim, 4),
                                 "file": cand["rel_path"],
                                 "heading": ce["heading"],
                                 "context": ce["context"],

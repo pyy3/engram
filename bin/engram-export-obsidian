@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""engram-export-obsidian — Export memory to Obsidian vault format.
+
+Usage:
+    engram export-obsidian [--output DIR] [--format obsidian|notion]
+
+Exports .claude/memory/ to an Obsidian-compatible vault structure with
+[[wikilinks]] and folder hierarchy, or Notion-compatible plain markdown.
+"""
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+
+LAYERS = ['active', 'semantic', 'procedural', 'lossless']
+
+
+def find_memory_root():
+    """Find .claude/memory/ starting from cwd, walking up."""
+    p = Path.cwd()
+    while p != p.parent:
+        candidate = p / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+        p = p.parent
+    return None
+
+
+def convert_to_wikilinks(content, all_files):
+    """Convert markdown links and 'See Also' references to [[wikilinks]]."""
+    # Convert [text](relative-path.md) to [[filename]]
+    def replace_md_link(m):
+        text = m.group(1)
+        path = m.group(2)
+        # Only convert local .md links
+        if path.startswith('http') or not path.endswith('.md'):
+            return m.group(0)
+        stem = Path(path).stem
+        if stem in all_files:
+            return f"[[{stem}]]"
+        return f"[[{stem}]]"
+
+    content = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', replace_md_link, content)
+
+    # Convert "See: filename.md" or "see [filename](path)" patterns
+    content = re.sub(
+        r'see\s+\[?([a-zA-Z0-9_-]+)\.md\]?',
+        lambda m: f"see [[{m.group(1)}]]",
+        content,
+        flags=re.IGNORECASE
+    )
+
+    return content
+
+
+def generate_index_obsidian(output_dir, file_map):
+    """Generate INDEX.md with Obsidian wikilinks."""
+    lines = ["# Engram Memory Index\n"]
+    for layer in LAYERS:
+        lines.append(f"\n## {layer.capitalize()}\n")
+        files = file_map.get(layer, [])
+        if not files:
+            lines.append("_No files_\n")
+        for f in sorted(files):
+            stem = Path(f).stem
+            lines.append(f"- [[{stem}]]")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def generate_index_notion(output_dir, file_map):
+    """Generate INDEX.md with plain markdown TOC."""
+    lines = ["# Engram Memory Index\n"]
+    lines.append("## Table of Contents\n")
+    for layer in LAYERS:
+        lines.append(f"\n### {layer.capitalize()}\n")
+        files = file_map.get(layer, [])
+        if not files:
+            lines.append("_No files_\n")
+        for f in sorted(files):
+            rel = f"{layer.capitalize()}/{f}"
+            lines.append(f"- [{f}]({rel})")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def export_memory(memory_root, output_dir, fmt):
+    """Export memory to vault structure."""
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    # Collect all file stems for wikilink resolution
+    all_files = set()
+    file_map = {}
+
+    for layer in LAYERS:
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            file_map[layer] = []
+            continue
+        files = [f.name for f in layer_dir.iterdir() if f.is_file() and not f.name.startswith('.')]
+        file_map[layer] = files
+        for f in files:
+            all_files.add(Path(f).stem)
+
+    # Export files
+    total = 0
+    for layer in LAYERS:
+        layer_dir = memory_root / layer
+        out_layer = output / layer.capitalize()
+        out_layer.mkdir(parents=True, exist_ok=True)
+
+        if not layer_dir.is_dir():
+            continue
+
+        for filename in file_map[layer]:
+            src = layer_dir / filename
+            content = src.read_text(encoding='utf-8', errors='replace')
+
+            if fmt == 'obsidian':
+                content = convert_to_wikilinks(content, all_files)
+
+            dst = out_layer / filename
+            dst.write_text(content, encoding='utf-8')
+            total += 1
+
+    # Generate index
+    if fmt == 'obsidian':
+        index_content = generate_index_obsidian(output, file_map)
+    else:
+        index_content = generate_index_notion(output, file_map)
+
+    (output / "INDEX.md").write_text(index_content, encoding='utf-8')
+    total += 1
+
+    return total
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Export engram memory to Obsidian/Notion vault')
+    parser.add_argument('--output', '-o', default='./engram-vault/',
+                        help='Output directory (default: ./engram-vault/)')
+    parser.add_argument('--format', '-f', choices=['obsidian', 'notion'], default='obsidian',
+                        help='Export format (default: obsidian)')
+    args = parser.parse_args()
+
+    memory_root = find_memory_root()
+    if not memory_root:
+        print("Error: No .claude/memory/ found in current or parent directories.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Exporting from: {memory_root}")
+    print(f"Format: {args.format}")
+    print(f"Output: {os.path.abspath(args.output)}")
+
+    count = export_memory(memory_root, args.output, args.format)
+    print(f"Exported {count} files.")
+
+
+if __name__ == '__main__':
+    main()

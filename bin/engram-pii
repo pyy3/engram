@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""engram-pii — PII auto-redaction scanner for memory files.
+
+Usage:
+    engram pii scan [--json]          Report PII findings
+    engram pii redact [--dry-run]     Replace PII with [REDACTED-TYPE] placeholders
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# PII detection patterns
+PII_PATTERNS = {
+    'EMAIL': re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'),
+    'PHONE': re.compile(
+        r'(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+    ),
+    'IPV4': re.compile(
+        r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
+    ),
+    'CREDIT_CARD': re.compile(
+        r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b'
+    ),
+    'SSN': re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
+    'AWS_KEY': re.compile(r'\bAKIA[0-9A-Z]{16}\b'),
+    'API_KEY_HEX': re.compile(r'\b[0-9a-fA-F]{32,}\b'),
+    'API_KEY_PREFIX': re.compile(
+        r'\b(?:sk-|pk_|sk_live_|pk_live_|sk_test_|pk_test_|ghp_|gho_|xox[bpras]-)[a-zA-Z0-9_-]{20,}\b'
+    ),
+}
+
+# Common false-positive exclusions
+FALSE_POSITIVE_IPS = {'127.0.0.1', '0.0.0.0', '255.255.255.255', '192.168.0.1', '10.0.0.1'}
+
+
+def find_memory_root():
+    """Find .claude/memory/ starting from cwd, walking up."""
+    p = Path.cwd()
+    while p != p.parent:
+        candidate = p / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+        p = p.parent
+    return None
+
+
+def scan_file(filepath):
+    """Scan a single file for PII patterns. Returns list of findings."""
+    findings = []
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='replace')
+    except (OSError, PermissionError):
+        return findings
+
+    for lineno, line in enumerate(content.splitlines(), 1):
+        for pii_type, pattern in PII_PATTERNS.items():
+            for match in pattern.finditer(line):
+                value = match.group()
+                # Skip false positives
+                if pii_type == 'IPV4' and value in FALSE_POSITIVE_IPS:
+                    continue
+                if pii_type == 'API_KEY_HEX':
+                    # Skip short hex that's probably a hash reference, git SHA, etc.
+                    if len(value) < 40:
+                        continue
+                    # Skip if inside a code block context (common for git shas)
+                    if 'commit' in line.lower() or 'sha' in line.lower():
+                        continue
+                findings.append({
+                    'file': str(filepath),
+                    'line': lineno,
+                    'type': pii_type,
+                    'match': value,
+                    'context': line.strip()[:100],
+                })
+    return findings
+
+
+def scan_all(memory_root):
+    """Scan all memory files for PII."""
+    all_findings = []
+    for dirpath, dirnames, filenames in os.walk(memory_root):
+        # Skip .archive directories
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        for filename in filenames:
+            if filename.startswith('.'):
+                continue
+            filepath = Path(dirpath) / filename
+            findings = scan_file(filepath)
+            all_findings.extend(findings)
+    return all_findings
+
+
+def redact_file(filepath, dry_run=False):
+    """Redact PII in a single file. Returns (count, changes)."""
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='replace')
+    except (OSError, PermissionError):
+        return 0, []
+
+    changes = []
+    new_content = content
+
+    for pii_type, pattern in PII_PATTERNS.items():
+        def replacer(match):
+            value = match.group()
+            if pii_type == 'IPV4' and value in FALSE_POSITIVE_IPS:
+                return value
+            if pii_type == 'API_KEY_HEX' and len(value) < 40:
+                return value
+            changes.append({'type': pii_type, 'original': value})
+            return f'[REDACTED-{pii_type}]'
+
+        new_content = pattern.sub(replacer, new_content)
+
+    if changes and not dry_run:
+        filepath.write_text(new_content, encoding='utf-8')
+
+    return len(changes), changes
+
+
+def cmd_scan(memory_root, as_json=False):
+    """Run scan and report."""
+    findings = scan_all(memory_root)
+
+    if as_json:
+        print(json.dumps(findings, indent=2))
+        return len(findings)
+
+    if not findings:
+        print("No PII patterns detected.")
+        return 0
+
+    # Group by file
+    by_file = {}
+    for f in findings:
+        by_file.setdefault(f['file'], []).append(f)
+
+    print(f"Found {len(findings)} potential PII match(es) in {len(by_file)} file(s):\n")
+    for filepath, file_findings in sorted(by_file.items()):
+        rel = os.path.relpath(filepath, memory_root)
+        print(f"  {rel}")
+        for ff in file_findings:
+            # Mask the actual value for safety
+            masked = ff['match'][:4] + '...' if len(ff['match']) > 8 else '***'
+            print(f"    L{ff['line']:>4}: [{ff['type']}] {masked}")
+        print()
+
+    return len(findings)
+
+
+def cmd_redact(memory_root, dry_run=False):
+    """Run redaction across all memory files."""
+    total_changes = 0
+    files_changed = 0
+
+    for dirpath, dirnames, filenames in os.walk(memory_root):
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        for filename in filenames:
+            if filename.startswith('.'):
+                continue
+            filepath = Path(dirpath) / filename
+            count, changes = redact_file(filepath, dry_run=dry_run)
+            if count > 0:
+                files_changed += 1
+                total_changes += count
+                rel = os.path.relpath(filepath, memory_root)
+                action = "Would redact" if dry_run else "Redacted"
+                print(f"  {action} {count} item(s) in {rel}")
+                for c in changes:
+                    masked = c['original'][:4] + '...' if len(c['original']) > 8 else '***'
+                    print(f"    [{c['type']}] {masked}")
+
+    mode = "(dry run)" if dry_run else ""
+    print(f"\n{total_changes} redaction(s) in {files_changed} file(s) {mode}".strip())
+    return total_changes
+
+
+def main():
+    parser = argparse.ArgumentParser(description='PII scanner for engram memory')
+    parser.add_argument('command', nargs='?', default='scan', choices=['scan', 'redact'],
+                        help='Command: scan (default) or redact')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be redacted')
+    parser.add_argument('--json', action='store_true', dest='as_json', help='Output as JSON')
+    args = parser.parse_args()
+
+    memory_root = find_memory_root()
+    if not memory_root:
+        print("Error: No .claude/memory/ found in current or parent directories.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.command == 'scan':
+        count = cmd_scan(memory_root, as_json=args.as_json)
+        sys.exit(0 if count == 0 else 1)
+    elif args.command == 'redact':
+        cmd_redact(memory_root, dry_run=args.dry_run)
+
+
+if __name__ == '__main__':
+    main()

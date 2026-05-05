@@ -1,0 +1,18 @@
+{
+  "name": "engram-memory",
+  "version": "0.6.0",
+  "description": "Persistent 5-layer memory system for Claude Code and AI coding agents",
+  "bin": {
+    "engram": "./bin/engram-npx.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/grynn-in/engram"
+  },
+  "keywords": ["claude", "memory", "ai", "coding"],
+  "license": "MIT",
+  "os": ["linux", "darwin"],
+  "engines": {
+    "node": ">=16"
+  }
+}

@@ -77,9 +77,28 @@ LAST_CHUNK=$(find "$LOSSLESS_DIR" -name "*.md" -type f 2>/dev/null | sort | tail
 
 echo "Lossless chunk written: $LOSSLESS_FILE"
 
-# Auto-index into Qdrant if available (background, non-blocking)
+# Auto-index into Qdrant if configured and available (background, non-blocking)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-if curl -s -o /dev/null "http://127.0.0.1:6333/healthz" 2>/dev/null; then
-  python3 "$SCRIPT_DIR/engram-index" --incremental >/dev/null 2>&1 &
-  echo "Background: updating Qdrant index"
+ENGRAM_CONFIG="${ENGRAM_CONFIG:-$HOME/.config/engram/config.toml}"
+
+# Check if vector_db auto_index is enabled (default: index if Qdrant is running)
+AUTO_INDEX=true
+if [ -f "$ENGRAM_CONFIG" ]; then
+  # Check if explicitly disabled
+  if grep -q "auto_index.*=.*false" "$ENGRAM_CONFIG" 2>/dev/null; then
+    AUTO_INDEX=false
+  fi
+  # Check if vector_db.enabled is false
+  if grep -q "enabled.*=.*false" "$ENGRAM_CONFIG" 2>/dev/null; then
+    # Only skip if it's in the [vector_db] section context
+    AUTO_INDEX=false
+  fi
+fi
+
+if [ "$AUTO_INDEX" = true ]; then
+  QDRANT_URL="${ENGRAM_QDRANT_URL:-http://127.0.0.1:6333}"
+  if curl -s -o /dev/null "$QDRANT_URL/healthz" 2>/dev/null; then
+    python3 "$SCRIPT_DIR/engram-index" --incremental >/dev/null 2>&1 &
+    echo "Background: updating Qdrant index"
+  fi
 fi

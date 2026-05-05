@@ -1,0 +1,8 @@
+# Template: react
+# Domain: React/Next.js web development
+
+[meta]
+name = "react"
+description = "React, Next.js, and modern frontend patterns"
+version = "0.1.0"
+tags = ["frontend", "react", "nextjs", "typescript"]

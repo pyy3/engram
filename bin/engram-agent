@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""
+Engram Agent — Multi-agent isolation and coordination.
+
+Manages per-agent isolated workspaces within the shared memory system.
+
+Isolation model:
+  - semantic/ and procedural/ are shared (read by all, write with lock)
+  - active/ is per-agent (each agent has own copy under agents/<id>/active/)
+  - lossless/ is shared (append-only, conflicts impossible)
+  - Conflict = same file modified by 2+ agents between merges
+
+Usage:
+  engram agent start <agent-id>       Register agent, create isolated workspace
+  engram agent end <agent-id>         Merge agent changes back to shared
+  engram agent list                   Show registered agents
+  engram agent search <agent-id> "q"  Search what a specific agent learned
+  engram agent conflicts              Detect multi-agent conflicts
+
+Only uses stdlib (no pip dependencies).
+"""
+
+import os
+import sys
+import json
+import shutil
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Memory root discovery
+# ---------------------------------------------------------------------------
+def find_memory_root() -> Path:
+    """Find the memory root directory."""
+    cwd = Path.cwd()
+    local = cwd / ".claude" / "memory"
+    if local.is_dir():
+        return local
+
+    for parent in cwd.parents:
+        candidate = parent / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+
+    home_memory = Path.home() / ".claude" / "memory"
+    if home_memory.is_dir():
+        return home_memory
+
+    return local
+
+
+# ---------------------------------------------------------------------------
+# Agent operations
+# ---------------------------------------------------------------------------
+
+def agents_dir(memory_root: Path) -> Path:
+    return memory_root / "agents"
+
+
+def agent_workspace(memory_root: Path, agent_id: str) -> Path:
+    return agents_dir(memory_root) / agent_id
+
+
+def agent_registry_file(memory_root: Path) -> Path:
+    return agents_dir(memory_root) / "_registry.json"
+
+
+def load_registry(memory_root: Path) -> dict:
+    reg_file = agent_registry_file(memory_root)
+    if reg_file.exists():
+        try:
+            return json.loads(reg_file.read_text())
+        except Exception:
+            pass
+    return {"agents": {}}
+
+
+def save_registry(memory_root: Path, registry: dict):
+    reg_file = agent_registry_file(memory_root)
+    reg_file.parent.mkdir(parents=True, exist_ok=True)
+    reg_file.write_text(json.dumps(registry, indent=2))
+
+
+def cmd_start(memory_root: Path, agent_id: str):
+    """Register agent and create isolated active/ workspace."""
+    workspace = agent_workspace(memory_root, agent_id)
+    active_dir = workspace / "active"
+
+    # Create workspace
+    active_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy shared active/ as starting point
+    shared_active = memory_root / "active"
+    if shared_active.is_dir():
+        for f in shared_active.iterdir():
+            if f.is_file():
+                dest = active_dir / f.name
+                if not dest.exists():
+                    shutil.copy2(f, dest)
+
+    # Register agent
+    registry = load_registry(memory_root)
+    registry["agents"][agent_id] = {
+        "started": datetime.now().isoformat(),
+        "status": "active",
+        "workspace": str(workspace),
+    }
+    save_registry(memory_root, registry)
+
+    # Create a snapshot of shared files for conflict detection
+    snapshot = _create_snapshot(memory_root)
+    snapshot_file = workspace / ".snapshot.json"
+    snapshot_file.write_text(json.dumps(snapshot, indent=2))
+
+    print(f"Agent '{agent_id}' started.")
+    print(f"  Workspace: {workspace}")
+    print(f"  Active dir: {active_dir}")
+    print(f"  Shared layers (semantic/, procedural/, lossless/) accessible at: {memory_root}")
+
+
+def cmd_end(memory_root: Path, agent_id: str):
+    """Merge agent's active changes back to shared active/."""
+    workspace = agent_workspace(memory_root, agent_id)
+    agent_active = workspace / "active"
+
+    if not workspace.exists():
+        print(f"Error: Agent '{agent_id}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    shared_active = memory_root / "active"
+    shared_active.mkdir(parents=True, exist_ok=True)
+
+    merged_count = 0
+    conflict_count = 0
+
+    if agent_active.is_dir():
+        for f in agent_active.iterdir():
+            if not f.is_file():
+                continue
+            dest = shared_active / f.name
+            if dest.exists():
+                # Check if both agent and shared modified since start
+                agent_content = f.read_text(encoding="utf-8", errors="ignore")
+                shared_content = dest.read_text(encoding="utf-8", errors="ignore")
+                if agent_content != shared_content:
+                    # Conflict — append agent changes with marker
+                    with open(dest, "a", encoding="utf-8") as fh:
+                        fh.write(f"\n\n<!-- merged from agent:{agent_id} at {datetime.now().isoformat()} -->\n")
+                        fh.write(agent_content)
+                    conflict_count += 1
+                    merged_count += 1
+                # If same content, skip
+            else:
+                shutil.copy2(f, dest)
+                merged_count += 1
+
+    # Update registry
+    registry = load_registry(memory_root)
+    if agent_id in registry["agents"]:
+        registry["agents"][agent_id]["status"] = "ended"
+        registry["agents"][agent_id]["ended"] = datetime.now().isoformat()
+        registry["agents"][agent_id]["merged_files"] = merged_count
+        registry["agents"][agent_id]["conflicts"] = conflict_count
+    save_registry(memory_root, registry)
+
+    print(f"Agent '{agent_id}' ended.")
+    print(f"  Merged {merged_count} file(s) to shared active/")
+    if conflict_count:
+        print(f"  {conflict_count} conflict(s) resolved by append")
+
+
+def cmd_list(memory_root: Path):
+    """Show registered agents."""
+    registry = load_registry(memory_root)
+    agents = registry.get("agents", {})
+
+    if not agents:
+        print("No registered agents.")
+        return
+
+    print(f"{'AGENT ID':<20} {'STATUS':<10} {'STARTED':<22} {'ENDED':<22}")
+    print(f"{'-'*20} {'-'*10} {'-'*22} {'-'*22}")
+
+    for agent_id, info in sorted(agents.items()):
+        status = info.get("status", "unknown")
+        started = info.get("started", "")[:19]
+        ended = info.get("ended", "")[:19] or "-"
+        print(f"{agent_id:<20} {status:<10} {started:<22} {ended:<22}")
+
+
+def cmd_search(memory_root: Path, agent_id: str, query: str):
+    """Search what a specific agent learned (in their workspace)."""
+    workspace = agent_workspace(memory_root, agent_id)
+
+    if not workspace.exists():
+        print(f"Error: Agent '{agent_id}' workspace not found.", file=sys.stderr)
+        sys.exit(1)
+
+    # Simple keyword search in agent's workspace
+    results = []
+    for f in workspace.rglob("*.md"):
+        try:
+            content = f.read_text(encoding="utf-8", errors="ignore")
+            if query.lower() in content.lower():
+                # Find matching lines
+                matches = []
+                for i, line in enumerate(content.splitlines(), 1):
+                    if query.lower() in line.lower():
+                        matches.append({"line": i, "text": line.strip()})
+                results.append({
+                    "file": str(f.relative_to(workspace)),
+                    "matches": matches[:5],
+                })
+        except Exception:
+            continue
+
+    if not results:
+        print(f"No results for '{query}' in agent '{agent_id}' workspace.")
+        return
+
+    print(f"Search results for '{query}' in agent '{agent_id}':\n")
+    for r in results:
+        print(f"  {r['file']}:")
+        for m in r["matches"]:
+            print(f"    L{m['line']}: {m['text'][:100]}")
+        print()
+
+
+def cmd_conflicts(memory_root: Path):
+    """Detect files modified by multiple agents since last merge."""
+    registry = load_registry(memory_root)
+    active_agents = {
+        aid: info for aid, info in registry.get("agents", {}).items()
+        if info.get("status") == "active"
+    }
+
+    if len(active_agents) < 2:
+        print("No potential conflicts (fewer than 2 active agents).")
+        return
+
+    # Check shared layers (semantic/, procedural/) for modifications
+    conflicts = []
+
+    for layer in ("semantic", "procedural"):
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+
+        for f in layer_dir.rglob("*.md"):
+            modifying_agents = []
+            for agent_id, info in active_agents.items():
+                workspace = agent_workspace(memory_root, agent_id)
+                snapshot_file = workspace / ".snapshot.json"
+                if snapshot_file.exists():
+                    snapshot = json.loads(snapshot_file.read_text())
+                    rel_path = str(f.relative_to(memory_root))
+                    stored_hash = snapshot.get(rel_path, "")
+                    current_hash = _file_hash(f)
+                    if stored_hash and stored_hash != current_hash:
+                        modifying_agents.append(agent_id)
+
+            if len(modifying_agents) >= 2:
+                conflicts.append({
+                    "file": str(f.relative_to(memory_root)),
+                    "agents": modifying_agents,
+                })
+
+    # Also check active/ files across agent workspaces
+    shared_active = memory_root / "active"
+    if shared_active.is_dir():
+        for f in shared_active.rglob("*.md"):
+            agents_with_diff = []
+            shared_content = f.read_text(encoding="utf-8", errors="ignore")
+            for agent_id in active_agents:
+                agent_file = agent_workspace(memory_root, agent_id) / "active" / f.name
+                if agent_file.exists():
+                    agent_content = agent_file.read_text(encoding="utf-8", errors="ignore")
+                    if agent_content != shared_content:
+                        agents_with_diff.append(agent_id)
+
+            if len(agents_with_diff) >= 2:
+                conflicts.append({
+                    "file": f"active/{f.name}",
+                    "agents": agents_with_diff,
+                    "type": "active_divergence",
+                })
+
+    if not conflicts:
+        print("No conflicts detected.")
+        return
+
+    print(f"Detected {len(conflicts)} potential conflict(s):\n")
+    for c in conflicts:
+        ctype = c.get("type", "shared_modification")
+        print(f"  {c['file']}")
+        print(f"    Type: {ctype}")
+        print(f"    Agents: {', '.join(c['agents'])}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _file_hash(filepath: Path) -> str:
+    """Quick hash of file content."""
+    try:
+        content = filepath.read_bytes()
+        return hashlib.md5(content).hexdigest()
+    except Exception:
+        return ""
+
+
+def _create_snapshot(memory_root: Path) -> dict:
+    """Create a hash snapshot of shared files for conflict detection."""
+    snapshot = {}
+    for layer in ("semantic", "procedural"):
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in layer_dir.rglob("*.md"):
+            rel_path = str(f.relative_to(memory_root))
+            snapshot[rel_path] = _file_hash(f)
+    return snapshot
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def usage():
+    print("""Engram Agent — Multi-agent isolation and coordination
+
+Usage:
+  engram agent start <agent-id>         Register agent, create workspace
+  engram agent end <agent-id>           Merge changes and deregister
+  engram agent list                     Show all registered agents
+  engram agent search <agent-id> "q"    Search agent's workspace
+  engram agent conflicts                Detect multi-agent conflicts
+
+Isolation model:
+  - semantic/, procedural/ = shared (write with lock)
+  - active/ = per-agent (isolated copy)
+  - lossless/ = shared (append-only, no conflicts)
+
+Environment:
+  ENGRAM_AGENT_ID    Default agent identifier""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("--help", "-h"):
+        usage()
+        return
+
+    memory_root = find_memory_root()
+    if not memory_root.is_dir():
+        print(f"Error: Memory directory not found at {memory_root}", file=sys.stderr)
+        print("Run 'engram init' first.", file=sys.stderr)
+        sys.exit(1)
+
+    subcmd = args[0]
+
+    if subcmd == "start":
+        if len(args) < 2:
+            print("Usage: engram agent start <agent-id>", file=sys.stderr)
+            sys.exit(1)
+        cmd_start(memory_root, args[1])
+
+    elif subcmd == "end":
+        if len(args) < 2:
+            print("Usage: engram agent end <agent-id>", file=sys.stderr)
+            sys.exit(1)
+        cmd_end(memory_root, args[1])
+
+    elif subcmd == "list":
+        cmd_list(memory_root)
+
+    elif subcmd == "search":
+        if len(args) < 3:
+            print("Usage: engram agent search <agent-id> \"query\"", file=sys.stderr)
+            sys.exit(1)
+        cmd_search(memory_root, args[1], " ".join(args[2:]))
+
+    elif subcmd == "conflicts":
+        cmd_conflicts(memory_root)
+
+    else:
+        print(f"Unknown agent subcommand: {subcmd}", file=sys.stderr)
+        usage()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+# Template: python
+# Domain: Python development best practices
+
+[meta]
+name = "python"
+description = "Python best practices, testing patterns, and project structure"
+version = "0.1.0"
+tags = ["python", "testing", "packaging", "backend"]

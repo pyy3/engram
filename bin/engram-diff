@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""engram-diff — Show changes between memory checkpoints.
+
+Usage:
+    engram diff                        Show changes since last lossless checkpoint
+    engram diff <date1> <date2>        Show changes between two dates (YYYY-MM-DD)
+    engram diff --last N               Show changes in last N checkpoints
+"""
+
+import argparse
+import difflib
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ANSI colors
+RED = '\033[31m'
+GREEN = '\033[32m'
+CYAN = '\033[36m'
+YELLOW = '\033[33m'
+DIM = '\033[2m'
+RESET = '\033[0m'
+BOLD = '\033[1m'
+
+
+def find_memory_root():
+    """Find .claude/memory/ starting from cwd, walking up."""
+    p = Path.cwd()
+    while p != p.parent:
+        candidate = p / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+        p = p.parent
+    return None
+
+
+def get_lossless_dates(memory_root):
+    """Get sorted list of lossless checkpoint dates."""
+    lossless_dir = memory_root / "lossless"
+    if not lossless_dir.is_dir():
+        return []
+    dates = []
+    for f in lossless_dir.iterdir():
+        if f.is_file() and re.match(r'\d{4}-\d{2}-\d{2}', f.stem):
+            try:
+                d = datetime.strptime(f.stem[:10], '%Y-%m-%d').date()
+                dates.append(d)
+            except ValueError:
+                pass
+    return sorted(set(dates))
+
+
+def snapshot_layer(layer_dir):
+    """Take a snapshot of all files in a layer directory."""
+    snapshot = {}
+    if not layer_dir.is_dir():
+        return snapshot
+    for f in layer_dir.iterdir():
+        if f.is_file() and not f.name.startswith('.'):
+            try:
+                snapshot[f.name] = f.read_text(encoding='utf-8', errors='replace')
+            except (OSError, PermissionError):
+                pass
+    return snapshot
+
+
+def get_file_mtime(filepath):
+    """Get file modification time as date."""
+    try:
+        return datetime.fromtimestamp(filepath.stat().st_mtime).date()
+    except OSError:
+        return None
+
+
+def diff_snapshots(old_snapshot, new_snapshot, layer_name):
+    """Compare two snapshots and produce diff output."""
+    output = []
+    all_files = sorted(set(list(old_snapshot.keys()) + list(new_snapshot.keys())))
+
+    for filename in all_files:
+        old_content = old_snapshot.get(filename)
+        new_content = new_snapshot.get(filename)
+
+        if old_content is None and new_content is not None:
+            output.append(f"{GREEN}+ {layer_name}/{filename} (added){RESET}")
+        elif old_content is not None and new_content is None:
+            output.append(f"{RED}- {layer_name}/{filename} (deleted){RESET}")
+        elif old_content != new_content:
+            output.append(f"{YELLOW}~ {layer_name}/{filename} (modified){RESET}")
+            # Show unified diff
+            old_lines = old_content.splitlines(keepends=True)
+            new_lines = new_content.splitlines(keepends=True)
+            diff = difflib.unified_diff(old_lines, new_lines, n=2)
+            for line in diff:
+                if line.startswith('+++') or line.startswith('---'):
+                    continue
+                elif line.startswith('@@'):
+                    output.append(f"{CYAN}{line.rstrip()}{RESET}")
+                elif line.startswith('+'):
+                    output.append(f"{GREEN}{line.rstrip()}{RESET}")
+                elif line.startswith('-'):
+                    output.append(f"{RED}{line.rstrip()}{RESET}")
+                else:
+                    output.append(f"{DIM}{line.rstrip()}{RESET}")
+
+    return output
+
+
+def cmd_since_last(memory_root):
+    """Show changes since last lossless checkpoint."""
+    dates = get_lossless_dates(memory_root)
+    if not dates:
+        print("No lossless checkpoints found.")
+        return
+
+    last_date = dates[-1]
+    today = datetime.now().date()
+
+    print(f"{BOLD}Changes since last checkpoint ({last_date}):{RESET}\n")
+
+    layers = ['active', 'semantic', 'procedural']
+    has_changes = False
+
+    for layer in layers:
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+
+        for f in sorted(layer_dir.iterdir()):
+            if f.is_file() and not f.name.startswith('.'):
+                mtime = get_file_mtime(f)
+                if mtime and mtime > last_date:
+                    has_changes = True
+                    if mtime == today:
+                        print(f"  {GREEN}~ {layer}/{f.name} (modified today){RESET}")
+                    else:
+                        print(f"  {YELLOW}~ {layer}/{f.name} (modified {mtime}){RESET}")
+
+    # Check for new lossless entries today
+    lossless_dir = memory_root / "lossless"
+    today_file = lossless_dir / f"{today.isoformat()}.md"
+    if today_file.exists():
+        has_changes = True
+        print(f"  {GREEN}+ lossless/{today_file.name} (today's log){RESET}")
+
+    if not has_changes:
+        print("  No changes since last checkpoint.")
+
+
+def cmd_between_dates(memory_root, date1_str, date2_str):
+    """Show changes between two dates based on file modification times."""
+    try:
+        date1 = datetime.strptime(date1_str, '%Y-%m-%d').date()
+        date2 = datetime.strptime(date2_str, '%Y-%m-%d').date()
+    except ValueError:
+        print("Error: Dates must be in YYYY-MM-DD format.", file=sys.stderr)
+        sys.exit(1)
+
+    if date1 > date2:
+        date1, date2 = date2, date1
+
+    print(f"{BOLD}Changes between {date1} and {date2}:{RESET}\n")
+
+    layers = ['active', 'semantic', 'procedural', 'lossless']
+    has_changes = False
+
+    for layer in layers:
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+
+        for f in sorted(layer_dir.iterdir()):
+            if f.is_file() and not f.name.startswith('.'):
+                mtime = get_file_mtime(f)
+                if mtime and date1 <= mtime <= date2:
+                    has_changes = True
+                    print(f"  {YELLOW}~ {layer}/{f.name} ({mtime}){RESET}")
+
+    if not has_changes:
+        print("  No changes in this date range.")
+
+
+def cmd_last_n(memory_root, n):
+    """Show changes in last N checkpoints."""
+    dates = get_lossless_dates(memory_root)
+    if not dates:
+        print("No lossless checkpoints found.")
+        return
+
+    recent = dates[-n:] if n <= len(dates) else dates
+    print(f"{BOLD}Last {len(recent)} checkpoint(s):{RESET}\n")
+
+    lossless_dir = memory_root / "lossless"
+    for d in reversed(recent):
+        filename = f"{d.isoformat()}.md"
+        filepath = lossless_dir / filename
+        if filepath.is_file():
+            content = filepath.read_text(encoding='utf-8', errors='replace')
+            # Extract summary headers (## lines)
+            headers = [l for l in content.splitlines() if l.startswith('## ')]
+            print(f"  {CYAN}{d}{RESET}")
+            for h in headers[:5]:
+                print(f"    {h}")
+            if len(headers) > 5:
+                print(f"    {DIM}...and {len(headers)-5} more sections{RESET}")
+            print()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Show changes between memory checkpoints')
+    parser.add_argument('dates', nargs='*', help='Date range: DATE1 DATE2 (YYYY-MM-DD)')
+    parser.add_argument('--last', type=int, metavar='N', help='Show last N checkpoints')
+    args = parser.parse_args()
+
+    memory_root = find_memory_root()
+    if not memory_root:
+        print("Error: No .claude/memory/ found in current or parent directories.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.last:
+        cmd_last_n(memory_root, args.last)
+    elif len(args.dates) == 2:
+        cmd_between_dates(memory_root, args.dates[0], args.dates[1])
+    elif len(args.dates) == 0:
+        cmd_since_last(memory_root)
+    else:
+        print("Usage: engram diff [DATE1 DATE2] [--last N]", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""engram-compact — Merge old lossless chunks into monthly summaries.
+
+Usage:
+    engram compact [--older-than DAYS] [--dry-run]
+
+Groups lossless files by month and compacts those older than threshold
+into a single summary file per month, archiving originals.
+"""
+
+import argparse
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def find_memory_root():
+    """Find .claude/memory/ starting from cwd, walking up."""
+    p = Path.cwd()
+    while p != p.parent:
+        candidate = p / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+        p = p.parent
+    return None
+
+
+def get_lossless_files(lossless_dir):
+    """Get all date-stamped lossless files grouped by month."""
+    by_month = defaultdict(list)
+
+    if not lossless_dir.is_dir():
+        return by_month
+
+    for f in sorted(lossless_dir.iterdir()):
+        if not f.is_file() or f.name.startswith('.'):
+            continue
+        # Match YYYY-MM-DD*.md files (not summary files)
+        m = re.match(r'^(\d{4}-\d{2})-(\d{2})', f.name)
+        if m and 'summary' not in f.name:
+            month_key = m.group(1)  # YYYY-MM
+            by_month[month_key].append(f)
+
+    return by_month
+
+
+def extract_summaries(filepath):
+    """Extract ## headers and their immediate content from a lossless file."""
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='replace')
+    except (OSError, PermissionError):
+        return ""
+
+    lines = content.splitlines()
+    summaries = []
+    current_header = None
+
+    for line in lines:
+        if line.startswith('## '):
+            if current_header:
+                summaries.append(current_header)
+            current_header = line
+        elif line.startswith('# ') and not line.startswith('## '):
+            # Top-level header (date header), include as context
+            summaries.append(line)
+            current_header = None
+
+    if current_header:
+        summaries.append(current_header)
+
+    return summaries
+
+
+def compact_month(lossless_dir, month_key, files, dry_run=False):
+    """Compact a month's files into a summary."""
+    summary_file = lossless_dir / f"{month_key}-summary.md"
+    archive_dir = lossless_dir / ".archive" / month_key
+
+    # Skip if already compacted
+    if summary_file.exists():
+        print(f"  Skip {month_key} (already compacted)")
+        return 0
+
+    # Collect all summaries
+    all_entries = []
+    all_entries.append(f"# Lossless Summary: {month_key}\n")
+    all_entries.append(f"Compacted from {len(files)} file(s) on {datetime.now().date().isoformat()}\n")
+
+    for f in sorted(files):
+        headers = extract_summaries(f)
+        if headers:
+            all_entries.append(f"\n---\n### {f.name}\n")
+            all_entries.extend(headers)
+
+    summary_content = "\n".join(all_entries) + "\n"
+
+    if dry_run:
+        print(f"  Would compact {month_key}: {len(files)} files -> {month_key}-summary.md")
+        for f in files:
+            print(f"    {f.name} -> .archive/{month_key}/{f.name}")
+        return len(files)
+
+    # Write summary
+    summary_file.write_text(summary_content, encoding='utf-8')
+
+    # Move originals to archive
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        dest = archive_dir / f.name
+        f.rename(dest)
+
+    print(f"  Compacted {month_key}: {len(files)} files -> {summary_file.name}")
+    return len(files)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Compact old lossless memory chunks')
+    parser.add_argument('--older-than', type=int, default=30, metavar='DAYS',
+                        help='Compact files older than N days (default: 30)')
+    parser.add_argument('--dry-run', action='store_true', help='Preview without making changes')
+    args = parser.parse_args()
+
+    memory_root = find_memory_root()
+    if not memory_root:
+        print("Error: No .claude/memory/ found in current or parent directories.", file=sys.stderr)
+        sys.exit(1)
+
+    lossless_dir = memory_root / "lossless"
+    if not lossless_dir.is_dir():
+        print("No lossless directory found.")
+        sys.exit(0)
+
+    cutoff = (datetime.now() - timedelta(days=args.older_than)).date()
+    by_month = get_lossless_files(lossless_dir)
+
+    if not by_month:
+        print("No lossless files to compact.")
+        sys.exit(0)
+
+    # Determine which months are eligible
+    eligible_months = {}
+    for month_key, files in sorted(by_month.items()):
+        # A month is eligible if ALL its files are older than cutoff
+        try:
+            month_date = datetime.strptime(month_key + "-01", '%Y-%m-%d').date()
+        except ValueError:
+            continue
+
+        # Check if the last day of this month is before cutoff
+        all_old = all(
+            datetime.strptime(f.stem[:10], '%Y-%m-%d').date() < cutoff
+            for f in files
+            if re.match(r'\d{4}-\d{2}-\d{2}', f.stem)
+        )
+
+        if all_old and len(files) > 1:
+            eligible_months[month_key] = files
+
+    if not eligible_months:
+        print(f"No months eligible for compaction (cutoff: {cutoff}, threshold: {args.older_than} days).")
+        sys.exit(0)
+
+    mode = "(dry run) " if args.dry_run else ""
+    print(f"Compacting lossless memory {mode}(older than {args.older_than} days):\n")
+
+    total_files = 0
+    for month_key, files in sorted(eligible_months.items()):
+        total_files += compact_month(lossless_dir, month_key, files, dry_run=args.dry_run)
+
+    print(f"\nTotal: {total_files} file(s) across {len(eligible_months)} month(s).")
+
+
+if __name__ == '__main__':
+    main()

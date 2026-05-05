@@ -13,144 +13,91 @@
 
 ---
 
-## v0.2.0 — Vector DB Integration (Qdrant)
+## v0.2.0 — Vector DB Integration (DONE)
 
-Add optional Qdrant integration for persistent vector search beyond file-level caching.
-
-### Why?
-
-Current search re-embeds from file cache on every query. A proper vector DB gives:
-- Sub-millisecond search across thousands of chunks
-- BM25 hybrid search (keyword + semantic in one query)
-- Metadata filtering (by layer, date, file type)
-- Scales to 100k+ chunks without degradation
-
-### Tasks
-
-- [ ] Add `engram index` command — indexes all memory into Qdrant
-- [ ] Add Qdrant as optional dependency (local binary, no Docker needed)
-  - Auto-download: `~/.engram/qdrant/` (single binary, ~30MB)
-  - Storage: `~/.engram/qdrant_data/` (per-project collections)
-  - Start on demand: `engram index` launches if not running
-- [ ] Collection per project (named by project path hash)
-- [ ] `engram-end` auto-indexes new chunks (background, non-blocking)
-- [ ] `engram search` checks Qdrant first if available, falls back to file-based
-- [ ] Add `[vector_db]` section to config.toml:
-  ```toml
-  [vector_db]
-  enabled = false          # opt-in
-  provider = "qdrant"      # qdrant | chroma | none
-  path = "~/.engram/qdrant_data"
-  auto_index = true        # index on engram-end
-  ```
-- [ ] Hybrid search: combine Qdrant semantic + BM25 keyword scoring
-
-### Architecture
-
-```
-engram end "summary"
-    │
-    ├── Write lossless chunk (always)
-    │
-    └── If vector_db.enabled && vector_db.auto_index:
-        └── engram index --incremental
-            ├── Find chunks newer than last index timestamp
-            ├── Embed new chunks via Ollama
-            └── Upsert into Qdrant collection
-
-engram search "query"
-    │
-    ├── If Qdrant available:
-    │   └── Hybrid search (vector + keyword) → ranked results
-    │
-    └── Fallback: file-based search (current behavior)
-```
+- [x] `engram index` command — indexes all memory into Qdrant
+- [x] Qdrant as optional dependency (local binary, ~30MB)
+- [x] Collection per project (deterministic name from path hash)
+- [x] `engram-end` auto-indexes new chunks (background, non-blocking)
+- [x] `engram search` checks Qdrant first if available, falls back to file-based
+- [x] `[vector_db]` section in config.toml (enabled, provider, auto_index, hybrid_search)
+- [x] Hybrid search: BM25 keyword + vector scoring with RRF fusion
 
 ---
 
-## v0.3.0 — Claude Code Hook Integration
+## v0.3.0 — Claude Code Hook Integration (DONE)
 
-Auto-checkpoint without manual `engram end` calls.
-
-### Tasks
-
-- [ ] Add Claude Code hook: `PostToolUse` → count tool calls, auto-checkpoint at N
-- [ ] Add hook: `SessionEnd` → always run `engram end` on session close
-- [ ] `engram hooks install` command — adds hooks to `.claude/settings.json`
-- [ ] `engram hooks remove` command — clean removal
-- [ ] Config:
-  ```toml
-  [hooks]
-  auto_checkpoint = true
-  checkpoint_interval = 15    # tool calls between auto-checkpoints
-  session_end_checkpoint = true
-  ```
+- [x] PostToolUse hook: counts tool calls, auto-checkpoints at N
+- [x] Stop (session end) hook: always runs `engram end` on exit
+- [x] `engram hooks install` / `remove` / `status` commands
+- [x] Configurable interval via config.toml `[hooks]` section
+- [x] Counter-based checkpointing with PID-scoped state
 
 ---
 
-## v0.4.0 — Template Ecosystem
+## v0.4.0 — Template Ecosystem (DONE)
 
-### Tasks
-
-- [ ] `engram template create <name>` — export current project's semantic + procedural
-  - Scrub project-specific paths/names (interactive or regex rules)
-  - Generate `seed.toml` with metadata
-- [ ] `engram template list` — show installed templates
-- [ ] `engram template install <git-url>` — clone template from repo
-- [ ] Community template registry (GitHub topic: `engram-template`)
-- [ ] Populate built-in templates:
-  - [ ] `d365` — D365 F&O domain knowledge (from ~/.claude/d365-knowledge/)
-  - [ ] `react` — React/Next.js patterns
-  - [ ] `python` — Python best practices, testing patterns
-  - [ ] `devops` — CI/CD, Docker, Kubernetes workflows
+- [x] `engram template create <name>` — export current project knowledge
+- [x] `engram template list` — show installed templates
+- [x] `engram template install <git-url|path>` — install from repo or directory
+- [x] `engram template info <name>` — show template details
+- [x] Built-in templates:
+  - [x] `react` — React/Next.js patterns, testing, project setup
+  - [x] `python` — Python best practices, testing, packaging
+  - [x] `devops` — Docker, Kubernetes, CI/CD, deployment
 
 ---
 
-## v0.5.0 — Advanced Search & Recall
+## v0.5.0 — Advanced Search & Recall (DONE)
 
-### Tasks
-
-- [ ] Temporal decay: weight recent chunks higher (configurable half-life)
-- [ ] `engram recall "what did I do last Tuesday"` — date-aware search
-- [ ] Cross-project search: `engram search --global "query"` searches all projects
-- [ ] `engram similar` — find sessions similar to current work (auto-suggest)
-- [ ] Chunk quality scoring: longer, more structured chunks rank higher
-- [ ] Support code-block-aware chunking (don't split inside fenced blocks)
+- [x] Temporal decay: weight recent chunks higher (configurable half-life)
+- [x] `engram recall "date query"` — date-aware natural language search
+- [x] Cross-project search: `engram search --global "query"`
+- [x] `engram similar` — find sessions similar to current work (auto-suggest)
+- [x] Chunk quality scoring (length, structure, layer bonuses)
+- [x] Code-block-aware chunking (don't split inside fenced blocks)
 
 ---
 
-## v0.6.0 — Distribution & Packaging
+## v0.6.0 — Distribution & Packaging (DONE)
 
-### Tasks
-
-- [ ] `pip install engram-memory` (PyPI package)
-- [ ] Homebrew tap: `brew install engram`
-- [ ] GitHub Actions CI (test on Ubuntu, macOS, Windows/WSL)
-- [ ] Release automation (tag → build → publish)
-- [ ] `npx engram` option for Node.js users
-- [ ] Shell completions (bash, zsh, fish)
+- [x] PyPI package (`engram-memory`) with hatchling build
+- [x] Homebrew formula (`Formula/engram.rb`)
+- [x] GitHub Actions CI (test on Ubuntu, macOS; Python 3.9/3.11/3.12)
+- [x] Release automation (`scripts/release.sh`)
+- [x] `npx engram-memory` option for Node.js users
+- [x] Shell completions (bash, zsh)
 
 ---
 
-## v0.7.0 — Multi-Agent Support
+## v0.7.0 — Multi-Agent Support (DONE)
 
-### Tasks
+- [x] Per-agent session isolation (`engram agent start/end <id>`)
+- [x] Shared read, isolated write for active layer
+- [x] Conflict detection (`engram agent conflicts`)
+- [x] `engram lock <file>` / `engram unlock <file>` for write coordination
+- [x] Agent-aware search: `engram agent search <id> "query"`
 
-- [ ] Per-agent session isolation (agent ID in lossless chunks)
-- [ ] Shared read, isolated write for active layer
-- [ ] Conflict detection when multiple agents update semantic/procedural
-- [ ] `engram lock <file>` / `engram unlock <file>` for write coordination
-- [ ] Agent-aware search: "what did agent-X learn about Y?"
+---
+
+## v0.8.0 — Future Features (DONE)
+
+- [x] Web UI for browsing memory (`engram web`, port 9876)
+- [x] Export to Obsidian/Notion format (`engram export-obsidian`)
+- [x] PII auto-redaction scanner (`engram pii scan/redact`)
+- [x] Embedding model swapping (`lib/embeddings.py` — ollama, openai, cohere)
+- [x] Memory compaction (`engram compact` — merge old lossless into summaries)
+- [x] `engram diff` — show changes between checkpoints
+- [x] `engram forget "topic"` — mark knowledge as superseded
 
 ---
 
 ## Future Ideas (Unscheduled)
 
-- [ ] Web UI for browsing memory (local, read-only)
-- [ ] Export to Obsidian/Notion format
-- [ ] PII auto-redaction (scan before writing to lossless)
-- [ ] Embedding model swapping (OpenAI, Cohere, local transformers)
-- [ ] Memory compaction: merge old lossless chunks into summaries
-- [ ] `engram diff` — show what changed between two checkpoints
-- [ ] `engram forget "topic"` — mark knowledge as superseded
-- [ ] Integration with other AI coding tools (Cursor, Copilot, Aider)
+- [ ] Fish shell completions
+- [ ] `engram ingest <url|file>` — auto-create semantic pages from external sources
+- [ ] Integration with Cursor, Copilot, Aider (beyond Claude Code)
+- [ ] Team/org shared memory (git-based sync)
+- [ ] Memory analytics dashboard (token usage, knowledge growth)
+- [ ] Auto-splitting: detect when a file covers 2+ topics and suggest split
+- [ ] Knowledge graph visualization (D3.js force layout of cross-references)

@@ -1,0 +1,221 @@
+#!/bin/bash
+# Engram Lock — Multi-agent file locking for shared memory layers.
+#
+# Usage:
+#   engram lock <file>             Lock a file (prevents other agents from writing)
+#   engram unlock <file>           Release a lock
+#   engram lock --list             Show all current locks
+#   engram lock --check <file>     Check if file is locked (exit 0=unlocked, 1=locked by another)
+#
+# Agent ID:
+#   From ENGRAM_AGENT_ID env var, or defaults to hostname-pid.
+#
+# Lock format (.locks/<hash>.lock):
+#   Line 1: agent_id
+#   Line 2: ISO timestamp
+#   Line 3: original file path
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Find memory root
+find_memory_root() {
+    local dir="$PWD"
+    while [ "$dir" != "/" ]; do
+        if [ -d "$dir/.claude/memory" ]; then
+            echo "$dir/.claude/memory"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    if [ -d "$HOME/.claude/memory" ]; then
+        echo "$HOME/.claude/memory"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
+MEMORY_ROOT="$(find_memory_root)"
+if [ -z "$MEMORY_ROOT" ]; then
+    echo "Error: No .claude/memory/ found. Run 'engram init' first." >&2
+    exit 1
+fi
+
+LOCKS_DIR="$MEMORY_ROOT/.locks"
+AGENT_ID="${ENGRAM_AGENT_ID:-$(hostname)-$$}"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+file_hash() {
+    # Create a safe hash from file path for lock filename
+    echo -n "$1" | md5sum | cut -c1-16
+}
+
+lock_path() {
+    local hash
+    hash="$(file_hash "$1")"
+    echo "$LOCKS_DIR/${hash}.lock"
+}
+
+create_lock() {
+    local file="$1"
+    local lpath
+    lpath="$(lock_path "$file")"
+
+    mkdir -p "$LOCKS_DIR"
+
+    # Check if already locked by another agent
+    if [ -f "$lpath" ]; then
+        local existing_agent
+        existing_agent="$(head -1 "$lpath")"
+        if [ "$existing_agent" != "$AGENT_ID" ]; then
+            local existing_time
+            existing_time="$(sed -n '2p' "$lpath")"
+            echo "Error: File is locked by agent '$existing_agent' since $existing_time" >&2
+            echo "File: $file" >&2
+            exit 1
+        fi
+        # Already locked by us — refresh timestamp
+    fi
+
+    # Write lock
+    printf '%s\n%s\n%s\n' "$AGENT_ID" "$(date -Iseconds)" "$file" > "$lpath"
+    echo "Locked: $file (agent: $AGENT_ID)"
+}
+
+remove_lock() {
+    local file="$1"
+    local lpath
+    lpath="$(lock_path "$file")"
+
+    if [ ! -f "$lpath" ]; then
+        echo "Warning: No lock found for $file" >&2
+        return 0
+    fi
+
+    local existing_agent
+    existing_agent="$(head -1 "$lpath")"
+    if [ "$existing_agent" != "$AGENT_ID" ]; then
+        echo "Error: Lock is owned by agent '$existing_agent', not '$AGENT_ID'" >&2
+        exit 1
+    fi
+
+    rm -f "$lpath"
+    echo "Unlocked: $file"
+}
+
+list_locks() {
+    if [ ! -d "$LOCKS_DIR" ] || [ -z "$(ls -A "$LOCKS_DIR" 2>/dev/null)" ]; then
+        echo "No active locks."
+        return 0
+    fi
+
+    printf "%-20s %-25s %s\n" "AGENT" "TIMESTAMP" "FILE"
+    printf "%-20s %-25s %s\n" "-----" "---------" "----"
+
+    for lfile in "$LOCKS_DIR"/*.lock; do
+        [ -f "$lfile" ] || continue
+        local agent timestamp filepath
+        agent="$(sed -n '1p' "$lfile")"
+        timestamp="$(sed -n '2p' "$lfile")"
+        filepath="$(sed -n '3p' "$lfile")"
+        printf "%-20s %-25s %s\n" "$agent" "$timestamp" "$filepath"
+    done
+}
+
+check_lock() {
+    local file="$1"
+    local lpath
+    lpath="$(lock_path "$file")"
+
+    if [ ! -f "$lpath" ]; then
+        # Unlocked
+        exit 0
+    fi
+
+    local existing_agent
+    existing_agent="$(head -1 "$lpath")"
+    if [ "$existing_agent" = "$AGENT_ID" ]; then
+        # Locked by us — considered "unlocked" for our purposes
+        exit 0
+    fi
+
+    # Locked by another agent
+    local existing_time
+    existing_time="$(sed -n '2p' "$lpath")"
+    echo "Locked by '$existing_agent' since $existing_time" >&2
+    exit 1
+}
+
+usage() {
+    cat << 'EOF'
+Engram Lock — Multi-agent file locking
+
+Usage:
+  engram lock <file>         Lock a file for exclusive write access
+  engram unlock <file>       Release a lock you hold
+  engram lock --list         Show all current locks
+  engram lock --check <file> Check lock status (exit 0=free, 1=locked)
+
+Environment:
+  ENGRAM_AGENT_ID    Agent identifier (default: hostname-pid)
+
+Lock files are stored in .claude/memory/.locks/
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    --list|-l)
+        list_locks
+        ;;
+    --check|-c)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: engram lock --check <file>" >&2
+            exit 1
+        fi
+        check_lock "$2"
+        ;;
+    --help|-h)
+        usage
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        # First arg is the file — determine if lock or unlock
+        # Check if called as "engram lock <file>" or "engram unlock <file>"
+        # The router passes through, so $0 might be engram-lock
+        # and $1 is the file. But if called via "engram unlock", the
+        # router strips "unlock" and re-execs this with remaining args.
+        #
+        # Actually this script handles both lock and unlock:
+        #   engram lock <file>   -> this script called with <file>
+        #   engram unlock <file> -> need to detect
+        #
+        # The CLI router handles "unlock" by calling this script with --unlock prefix
+        # But for simplicity, check ENGRAM_LOCK_ACTION env var or script name
+
+        SCRIPT_NAME="$(basename "$0")"
+        if [ "$SCRIPT_NAME" = "engram-lock" ]; then
+            # Default action is lock
+            if [ "$1" = "unlock" ]; then
+                shift
+                remove_lock "${1:?File required}"
+            else
+                create_lock "$1"
+            fi
+        else
+            create_lock "$1"
+        fi
+        ;;
+esac

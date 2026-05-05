@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""engram-web — Local web UI for browsing memory layers.
+
+Usage:
+    engram web [--port PORT]
+
+Starts a local HTTP server serving a single-page app for browsing
+the engram memory system (Active, Semantic, Procedural, Lossless).
+"""
+
+import argparse
+import json
+import os
+import sys
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+def find_memory_root():
+    """Find .claude/memory/ starting from cwd, walking up."""
+    p = Path.cwd()
+    while p != p.parent:
+        candidate = p / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+        p = p.parent
+    return None
+
+MEMORY_ROOT = find_memory_root()
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Engram Memory Browser</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: grid; grid-template-rows: 48px 1fr; grid-template-columns: 280px 1fr; }
+#topbar { grid-column: 1 / -1; background: #16213e; display: flex; align-items: center; padding: 0 16px; gap: 12px; border-bottom: 1px solid #0f3460; }
+#topbar h1 { font-size: 14px; color: #7ec8e3; white-space: nowrap; }
+#search { flex: 1; max-width: 400px; padding: 6px 12px; border-radius: 4px; border: 1px solid #0f3460; background: #1a1a2e; color: #e0e0e0; font-size: 13px; }
+#sidebar { background: #16213e; overflow-y: auto; border-right: 1px solid #0f3460; padding: 8px 0; }
+.layer-tab { display: block; width: 100%; padding: 8px 16px; border: none; background: none; color: #a0a0a0; text-align: left; cursor: pointer; font-size: 13px; }
+.layer-tab:hover { background: #1a1a2e; color: #e0e0e0; }
+.layer-tab.active { background: #0f3460; color: #7ec8e3; font-weight: 600; }
+.file-item { display: block; width: 100%; padding: 5px 16px 5px 28px; border: none; background: none; color: #c0c0c0; text-align: left; cursor: pointer; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-item:hover { background: #1a1a2e; color: #fff; }
+.file-item.active { color: #7ec8e3; background: #1a1a2e; }
+#content { padding: 24px 32px; overflow-y: auto; line-height: 1.6; font-size: 14px; }
+#content h1, #content h2, #content h3 { color: #7ec8e3; margin: 16px 0 8px; }
+#content h1 { font-size: 20px; } #content h2 { font-size: 16px; } #content h3 { font-size: 14px; }
+#content pre { background: #0f3460; padding: 12px; border-radius: 4px; overflow-x: auto; margin: 8px 0; }
+#content code { font-family: 'Fira Code', monospace; font-size: 13px; color: #a8d8ea; }
+#content p { margin: 6px 0; }
+#content ul, #content ol { padding-left: 20px; margin: 6px 0; }
+#content strong { color: #fff; }
+#content em { color: #a8d8ea; }
+#content a { color: #7ec8e3; }
+.empty { color: #666; padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <h1>ENGRAM</h1>
+  <input id="search" type="text" placeholder="Search files..." />
+</div>
+<div id="sidebar">
+  <button class="layer-tab active" data-layer="active">Active</button>
+  <div id="files-active" class="file-list"></div>
+  <button class="layer-tab" data-layer="semantic">Semantic</button>
+  <div id="files-semantic" class="file-list"></div>
+  <button class="layer-tab" data-layer="procedural">Procedural</button>
+  <div id="files-procedural" class="file-list"></div>
+  <button class="layer-tab" data-layer="lossless">Lossless</button>
+  <div id="files-lossless" class="file-list"></div>
+</div>
+<div id="content"><div class="empty">Select a file to view</div></div>
+<script>
+const layers = ['active','semantic','procedural','lossless'];
+let allFiles = {};
+
+async function loadFiles() {
+  const resp = await fetch('/api/files');
+  allFiles = await resp.json();
+  renderFiles();
+}
+
+function renderFiles(filter='') {
+  const f = filter.toLowerCase();
+  layers.forEach(layer => {
+    const el = document.getElementById('files-'+layer);
+    const files = (allFiles[layer]||[]).filter(x => !f || x.toLowerCase().includes(f));
+    el.innerHTML = files.map(name =>
+      `<button class="file-item" data-layer="${layer}" data-file="${name}">${name}</button>`
+    ).join('');
+  });
+}
+
+async function loadFile(layer, file) {
+  const resp = await fetch('/api/file?layer='+encodeURIComponent(layer)+'&file='+encodeURIComponent(file));
+  const text = await resp.text();
+  document.getElementById('content').innerHTML = renderMarkdown(text);
+  document.querySelectorAll('.file-item').forEach(el => el.classList.remove('active'));
+  document.querySelector(`.file-item[data-layer="${layer}"][data-file="${file}"]`)?.classList.add('active');
+}
+
+function renderMarkdown(md) {
+  let html = md.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Code blocks
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (m,lang,code) => `<pre><code>${code}</code></pre>`);
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Headings
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // Bold/italic
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  // Lists
+  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/(<li>.*<\/li>\n?)+/g, m => '<ul>'+m+'</ul>');
+  // Links
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+  // Paragraphs (lines not already wrapped)
+  html = html.replace(/^(?!<[huplo])(.*\S.*)$/gm, '<p>$1</p>');
+  return html;
+}
+
+document.getElementById('sidebar').addEventListener('click', e => {
+  if (e.target.classList.contains('layer-tab')) {
+    document.querySelectorAll('.layer-tab').forEach(t => t.classList.remove('active'));
+    e.target.classList.add('active');
+  }
+  if (e.target.classList.contains('file-item')) {
+    loadFile(e.target.dataset.layer, e.target.dataset.file);
+  }
+});
+
+document.getElementById('search').addEventListener('input', e => renderFiles(e.target.value));
+loadFiles();
+</script>
+</body>
+</html>"""
+
+
+class EngramHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # suppress request logs
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == '/api/files':
+            self.send_json(self.get_files())
+        elif parsed.path == '/api/file':
+            params = parse_qs(parsed.query)
+            layer = params.get('layer', [''])[0]
+            file = params.get('file', [''])[0]
+            self.send_file_content(layer, file)
+        else:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.encode())
+
+    def get_files(self):
+        result = {}
+        if not MEMORY_ROOT:
+            return result
+        for layer in ['active', 'semantic', 'procedural', 'lossless']:
+            layer_dir = MEMORY_ROOT / layer
+            if layer_dir.is_dir():
+                files = sorted(
+                    f.name for f in layer_dir.iterdir()
+                    if f.is_file() and not f.name.startswith('.')
+                )
+                result[layer] = files
+            else:
+                result[layer] = []
+        return result
+
+    def send_json(self, data):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_file_content(self, layer, filename):
+        if not MEMORY_ROOT or not layer or not filename:
+            self.send_error(400)
+            return
+        # Sanitize
+        if '..' in filename or '/' in filename:
+            self.send_error(403)
+            return
+        filepath = MEMORY_ROOT / layer / filename
+        if not filepath.is_file():
+            self.send_error(404)
+            return
+        content = filepath.read_text(encoding='utf-8', errors='replace')
+        body = content.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Engram memory web browser')
+    parser.add_argument('--port', type=int, default=9876, help='Port to serve on (default: 9876)')
+    args = parser.parse_args()
+
+    if not MEMORY_ROOT:
+        print("Error: No .claude/memory/ found in current or parent directories.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Engram web UI: http://localhost:{args.port}")
+    print(f"Memory root: {MEMORY_ROOT}")
+    print("Press Ctrl+C to stop.")
+
+    server = HTTPServer(('127.0.0.1', args.port), EngramHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.server_close()
+
+
+if __name__ == '__main__':
+    main()

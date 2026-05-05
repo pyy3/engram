@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""
+Engram Recall — Date-aware natural language search over memory layers.
+
+Parses natural language date expressions and searches lossless/ files by
+filename date pattern (YYYY-MM-DD_HHMM.md or YYYY-MM-DD.md), and
+semantic/procedural files by mtime.
+
+Usage:
+  engram recall "what did I do last Tuesday"
+  engram recall "yesterday's progress"
+  engram recall "work from March 2026"
+  engram recall "last week" --json
+
+Only uses stdlib (no dateutil).
+"""
+
+import os
+import sys
+import re
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+
+
+# ---------------------------------------------------------------------------
+# Date parsing — natural language to date range
+# ---------------------------------------------------------------------------
+
+WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3,
+    "fri": 4, "sat": 5, "sun": 6,
+}
+
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9,
+    "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def parse_date_query(text: str) -> tuple:
+    """
+    Parse natural language date query into (start_date, end_date) range.
+    Returns (datetime, datetime) or (None, None) if unparsable.
+    """
+    text_lower = text.lower().strip()
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # "today"
+    if "today" in text_lower:
+        return (today_start, now)
+
+    # "yesterday"
+    if "yesterday" in text_lower:
+        start = today_start - timedelta(days=1)
+        end = today_start - timedelta(seconds=1)
+        return (start, end)
+
+    # "N days/weeks/months ago"
+    m = re.search(r'(\d+)\s+(day|week|month)s?\s+ago', text_lower)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == "day":
+            target = today_start - timedelta(days=n)
+            return (target, target + timedelta(hours=23, minutes=59, seconds=59))
+        elif unit == "week":
+            target_end = today_start - timedelta(weeks=n - 1)
+            target_start = today_start - timedelta(weeks=n)
+            return (target_start, target_end + timedelta(hours=23, minutes=59, seconds=59))
+        elif unit == "month":
+            month = now.month - n
+            year = now.year
+            while month <= 0:
+                month += 12
+                year -= 1
+            start = datetime(year, month, 1)
+            # End of that month
+            if month == 12:
+                end = datetime(year + 1, 1, 1) - timedelta(seconds=1)
+            else:
+                end = datetime(year, month + 1, 1) - timedelta(seconds=1)
+            return (start, end)
+
+    # "last week"
+    if "last week" in text_lower:
+        # Monday of last week to Sunday of last week
+        days_since_monday = now.weekday()
+        this_monday = today_start - timedelta(days=days_since_monday)
+        last_monday = this_monday - timedelta(weeks=1)
+        last_sunday = this_monday - timedelta(seconds=1)
+        return (last_monday, last_sunday)
+
+    # "this week"
+    if "this week" in text_lower:
+        days_since_monday = now.weekday()
+        this_monday = today_start - timedelta(days=days_since_monday)
+        return (this_monday, now)
+
+    # "last month"
+    if "last month" in text_lower:
+        first_of_this = today_start.replace(day=1)
+        last_day_prev = first_of_this - timedelta(seconds=1)
+        first_of_prev = last_day_prev.replace(day=1, hour=0, minute=0, second=0)
+        return (first_of_prev, last_day_prev)
+
+    # "this month"
+    if "this month" in text_lower:
+        first_of_this = today_start.replace(day=1)
+        return (first_of_this, now)
+
+    # "last Monday/Tuesday/..." or "last <weekday>"
+    for day_name, day_num in WEEKDAYS.items():
+        if f"last {day_name}" in text_lower:
+            days_back = (now.weekday() - day_num) % 7
+            if days_back == 0:
+                days_back = 7  # "last Monday" when today is Monday means 7 days ago
+            target = today_start - timedelta(days=days_back)
+            return (target, target + timedelta(hours=23, minutes=59, seconds=59))
+
+    # Bare weekday name (e.g., "tuesday") — most recent past occurrence
+    for day_name, day_num in WEEKDAYS.items():
+        if day_name in text_lower and "last" not in text_lower:
+            days_back = (now.weekday() - day_num) % 7
+            if days_back == 0:
+                days_back = 7
+            target = today_start - timedelta(days=days_back)
+            return (target, target + timedelta(hours=23, minutes=59, seconds=59))
+
+    # "March 2026" or "march" (month + optional year)
+    for month_name, month_num in MONTHS.items():
+        if month_name in text_lower:
+            # Check for year
+            year_match = re.search(r'20\d{2}', text_lower)
+            year = int(year_match.group()) if year_match else now.year
+            start = datetime(year, month_num, 1)
+            if month_num == 12:
+                end = datetime(year + 1, 1, 1) - timedelta(seconds=1)
+            else:
+                end = datetime(year, month_num + 1, 1) - timedelta(seconds=1)
+            return (start, end)
+
+    # Explicit date "2026-03-15"
+    m = re.search(r'(\d{4})-(\d{2})-(\d{2})', text_lower)
+    if m:
+        target = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return (target, target + timedelta(hours=23, minutes=59, seconds=59))
+
+    # Explicit date "03/15/2026" or "15.03.2026"
+    m = re.search(r'(\d{1,2})[/.](\d{1,2})[/.](\d{4})', text_lower)
+    if m:
+        try:
+            target = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            return (target, target + timedelta(hours=23, minutes=59, seconds=59))
+        except ValueError:
+            try:
+                target = datetime(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+                return (target, target + timedelta(hours=23, minutes=59, seconds=59))
+            except ValueError:
+                pass
+
+    return (None, None)
+
+
+# ---------------------------------------------------------------------------
+# File matching
+# ---------------------------------------------------------------------------
+
+def date_from_filename(filename: str):
+    """Extract date from lossless filename pattern YYYY-MM-DD or YYYY-MM-DD_HHMM."""
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})(?:_(\d{2})(\d{2}))?', filename)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hour = int(m.group(4)) if m.group(4) else 0
+        minute = int(m.group(5)) if m.group(5) else 0
+        try:
+            return datetime(year, month, day, hour, minute)
+        except ValueError:
+            return None
+    return None
+
+
+def find_memory_root() -> Path:
+    """Find the memory root directory."""
+    # Check current directory
+    cwd = Path.cwd()
+    local = cwd / ".claude" / "memory"
+    if local.is_dir():
+        return local
+
+    # Walk up
+    for parent in cwd.parents:
+        candidate = parent / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+
+    # Fallback to home
+    home_memory = Path.home() / ".claude" / "memory"
+    if home_memory.is_dir():
+        return home_memory
+
+    return local  # Will fail with a useful error
+
+
+def search_by_date_range(memory_root: Path, start_dt: datetime, end_dt: datetime) -> list:
+    """Search memory files that fall within the date range."""
+    results = []
+
+    # 1. Search lossless/ by filename date
+    lossless_dir = memory_root / "lossless"
+    if lossless_dir.is_dir():
+        for f in sorted(lossless_dir.rglob("*.md")):
+            file_dt = date_from_filename(f.name)
+            if file_dt and start_dt <= file_dt <= end_dt:
+                try:
+                    content = f.read_text(encoding="utf-8", errors="ignore")
+                    results.append({
+                        "layer": "lossless",
+                        "file": str(f.relative_to(memory_root.parent)),
+                        "timestamp": file_dt.isoformat(),
+                        "size": len(content),
+                        "preview": _extract_preview(content),
+                    })
+                except Exception:
+                    pass
+
+    # 2. Search semantic/ and procedural/ by mtime
+    for layer in ("semantic", "procedural", "active"):
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in sorted(layer_dir.rglob("*.md")):
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                if start_dt <= mtime <= end_dt:
+                    content = f.read_text(encoding="utf-8", errors="ignore")
+                    results.append({
+                        "layer": layer,
+                        "file": str(f.relative_to(memory_root.parent)),
+                        "timestamp": mtime.isoformat(),
+                        "size": len(content),
+                        "preview": _extract_preview(content),
+                    })
+            except Exception:
+                pass
+
+    # Sort by timestamp descending
+    results.sort(key=lambda x: x["timestamp"], reverse=True)
+    return results
+
+
+def _extract_preview(content: str, max_chars: int = 400) -> str:
+    """Extract a meaningful preview from content."""
+    lines = content.splitlines()
+    preview_lines = []
+    char_count = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if char_count + len(stripped) > max_chars:
+            break
+        preview_lines.append(stripped)
+        char_count += len(stripped)
+
+    return "\n".join(preview_lines)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    args = sys.argv[1:]
+    json_mode = False
+    root_override = None
+    query_parts = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--json":
+            json_mode = True
+        elif args[i] == "--root":
+            i += 1
+            if i < len(args):
+                root_override = args[i]
+        elif args[i] in ("--help", "-h"):
+            print("Usage: engram recall \"natural language date query\" [--json] [--root PATH]")
+            print("")
+            print("Examples:")
+            print("  engram recall \"what did I do last Tuesday\"")
+            print("  engram recall \"yesterday's progress\"")
+            print("  engram recall \"work from March 2026\"")
+            print("  engram recall \"last week\" --json")
+            print("  engram recall \"2 weeks ago\"")
+            print("  engram recall \"this month\"")
+            print("")
+            print("Supported date patterns:")
+            print("  today, yesterday")
+            print("  last Monday/Tuesday/etc")
+            print("  N days/weeks/months ago")
+            print("  last week, this week, last month, this month")
+            print("  March, March 2026, 2026-03-15")
+            return
+        else:
+            query_parts.append(args[i])
+        i += 1
+
+    query = " ".join(query_parts)
+    if not query:
+        print("Usage: engram recall \"natural language date query\" [--json] [--root PATH]",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Find memory root
+    if root_override:
+        memory_root = Path(root_override) / ".claude" / "memory"
+    else:
+        memory_root = find_memory_root()
+
+    if not memory_root.is_dir():
+        print(f"Error: Memory directory not found at {memory_root}", file=sys.stderr)
+        print("Run 'engram init' first.", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse date from query
+    start_dt, end_dt = parse_date_query(query)
+
+    if start_dt is None:
+        print(f"Could not parse a date from: \"{query}\"", file=sys.stderr)
+        print("Try: today, yesterday, last Tuesday, 2 weeks ago, March 2026, etc.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Search
+    results = search_by_date_range(memory_root, start_dt, end_dt)
+
+    # Output
+    output = {
+        "query": query,
+        "date_range": {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+        },
+        "results_count": len(results),
+        "results": results,
+    }
+
+    if json_mode:
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"Recall: \"{query}\"")
+        print(f"Date range: {start_dt.strftime('%Y-%m-%d %H:%M')} to {end_dt.strftime('%Y-%m-%d %H:%M')}")
+        print(f"Found {len(results)} file(s)\n")
+
+        if not results:
+            print("No memory entries found in this date range.")
+            return
+
+        for r in results:
+            print(f"[{r['layer']}] {r['file']}")
+            print(f"  Timestamp: {r['timestamp']}")
+            print(f"  Size: {r['size']} chars")
+            if r["preview"]:
+                # Indent preview
+                preview_lines = r["preview"].splitlines()[:5]
+                for pl in preview_lines:
+                    print(f"    {pl}")
+            print()
+
+
+if __name__ == "__main__":
+    main()

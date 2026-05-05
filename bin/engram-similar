@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+Engram Similar — Find past sessions similar to current work.
+
+Reads active/current-tasks.md as context, embeds it via Ollama,
+and searches lossless/ chunks for similar past sessions.
+
+Usage:
+  engram similar                    # Find similar past sessions
+  engram similar --json             # Output as JSON
+  engram similar --context "topic"  # Override context (instead of reading active/)
+
+Only uses stdlib (no pip dependencies).
+"""
+
+import os
+import sys
+import json
+import re
+from pathlib import Path
+from datetime import datetime
+import urllib.request
+import urllib.error
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+OLLAMA_URL = os.environ.get(
+    "ENGRAM_OLLAMA_URL",
+    "http://127.0.0.1:11434/api/embeddings"
+)
+EMBEDDING_MODEL = os.environ.get("ENGRAM_MODEL", "nomic-embed-text")
+MAX_RESULTS = 5
+MAX_EMBED_CHARS = 2000
+
+
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+def get_embedding(text: str) -> list:
+    """Get embedding vector from Ollama using only stdlib."""
+    if not text.strip():
+        return []
+
+    data = json.dumps({"model": EMBEDDING_MODEL, "prompt": text[:MAX_EMBED_CHARS]}).encode()
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read()).get("embedding", [])
+    except (urllib.error.URLError, OSError) as e:
+        print(f"Warning: Could not connect to Ollama at {OLLAMA_URL}: {e}",
+              file=sys.stderr)
+        return []
+
+
+def cosine_similarity(a: list, b: list) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
+    norm_b = (sum(x * x for x in b) ** 0.5) or 1.0
+    return dot / (norm_a * norm_b)
+
+
+# ---------------------------------------------------------------------------
+# Session chunking
+# ---------------------------------------------------------------------------
+def extract_sessions(lossless_dir: Path) -> list:
+    """Extract session summaries from lossless files."""
+    sessions = []
+
+    for f in sorted(lossless_dir.rglob("*.md")):
+        try:
+            content = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        # Split by session markers (## headers or --- separators)
+        chunks = re.split(r'\n(?=## |\n---\n)', content)
+
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if len(chunk) < 50:
+                continue
+
+            # Extract heading if present
+            heading = ""
+            m = re.match(r'^##\s+(.+)', chunk)
+            if m:
+                heading = m.group(1).strip()
+
+            # Extract date from filename
+            date_match = re.match(r'(\d{4})-(\d{2})-(\d{2})', f.name)
+            date_str = f.name[:10] if date_match else ""
+
+            sessions.append({
+                "file": str(f.name),
+                "date": date_str,
+                "heading": heading,
+                "text": chunk,
+                "path": str(f),
+            })
+
+    return sessions
+
+
+def find_related_files(memory_root: Path, query_emb: list, top_n: int = 3) -> list:
+    """Find semantic/procedural files related to the query."""
+    related = []
+
+    for layer in ("semantic", "procedural"):
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+
+        for f in layer_dir.rglob("*.md"):
+            try:
+                content = f.read_text(encoding="utf-8", errors="ignore")
+                if len(content) < 30:
+                    continue
+                file_emb = get_embedding(content[:MAX_EMBED_CHARS])
+                if file_emb:
+                    sim = cosine_similarity(query_emb, file_emb)
+                    if sim > 0.2:
+                        related.append({
+                            "file": str(f.relative_to(memory_root.parent)),
+                            "layer": layer,
+                            "score": round(sim, 4),
+                            "preview": content[:200].replace("\n", " ").strip(),
+                        })
+            except Exception:
+                continue
+
+    related.sort(key=lambda x: -x["score"])
+    return related[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# Memory root discovery
+# ---------------------------------------------------------------------------
+def find_memory_root() -> Path:
+    """Find the memory root directory."""
+    cwd = Path.cwd()
+    local = cwd / ".claude" / "memory"
+    if local.is_dir():
+        return local
+
+    for parent in cwd.parents:
+        candidate = parent / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+
+    home_memory = Path.home() / ".claude" / "memory"
+    if home_memory.is_dir():
+        return home_memory
+
+    return local
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    args = sys.argv[1:]
+    json_mode = False
+    context_override = None
+    root_override = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--json":
+            json_mode = True
+        elif args[i] == "--context":
+            i += 1
+            if i < len(args):
+                context_override = args[i]
+        elif args[i] == "--root":
+            i += 1
+            if i < len(args):
+                root_override = args[i]
+        elif args[i] in ("--help", "-h"):
+            print("Usage: engram similar [--json] [--context \"topic\"] [--root PATH]")
+            print("")
+            print("Find past sessions similar to your current work context.")
+            print("")
+            print("Options:")
+            print("  --json              Output as JSON")
+            print("  --context \"topic\"   Override context (default: reads active/current-tasks.md)")
+            print("  --root PATH         Override project root path")
+            print("")
+            print("What it does:")
+            print("  1. Reads active/current-tasks.md as context")
+            print("  2. Embeds it via Ollama (nomic-embed-text)")
+            print("  3. Searches lossless/ for similar past sessions")
+            print("  4. Returns top 5 most relevant past sessions")
+            print("  5. Suggests related semantic/procedural files")
+            return
+        i += 1
+
+    # Find memory root
+    if root_override:
+        memory_root = Path(root_override) / ".claude" / "memory"
+    else:
+        memory_root = find_memory_root()
+
+    if not memory_root.is_dir():
+        print(f"Error: Memory directory not found at {memory_root}", file=sys.stderr)
+        print("Run 'engram init' first.", file=sys.stderr)
+        sys.exit(1)
+
+    # Get context
+    if context_override:
+        context_text = context_override
+    else:
+        tasks_file = memory_root / "active" / "current-tasks.md"
+        if tasks_file.exists():
+            context_text = tasks_file.read_text(encoding="utf-8", errors="ignore")
+        else:
+            print("Warning: No active/current-tasks.md found. Use --context to provide context.",
+                  file=sys.stderr)
+            # Try context-inject as fallback
+            inject_file = memory_root / "active" / "context-inject.md"
+            if inject_file.exists():
+                context_text = inject_file.read_text(encoding="utf-8", errors="ignore")
+            else:
+                print("Error: No context available. Use --context \"your topic\".", file=sys.stderr)
+                sys.exit(1)
+
+    if not context_text.strip():
+        print("Error: Context is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    # Embed context
+    if not json_mode:
+        print("Embedding current context...", file=sys.stderr)
+    context_emb = get_embedding(context_text)
+    if not context_emb:
+        print("Error: Failed to generate embedding. Is Ollama running?", file=sys.stderr)
+        sys.exit(1)
+
+    # Find lossless sessions
+    lossless_dir = memory_root / "lossless"
+    if not lossless_dir.is_dir():
+        print("Warning: No lossless/ directory found.", file=sys.stderr)
+        sessions = []
+    else:
+        if not json_mode:
+            print("Searching past sessions...", file=sys.stderr)
+        sessions = extract_sessions(lossless_dir)
+
+    # Score sessions by similarity
+    scored_sessions = []
+    for session in sessions:
+        session_emb = get_embedding(session["text"][:MAX_EMBED_CHARS])
+        if session_emb:
+            sim = cosine_similarity(context_emb, session_emb)
+            if sim > 0.15:
+                scored_sessions.append({
+                    "score": round(sim, 4),
+                    "file": session["file"],
+                    "date": session["date"],
+                    "heading": session["heading"],
+                    "preview": session["text"][:300].replace("\n", " ").strip(),
+                    "path": session["path"],
+                })
+
+    scored_sessions.sort(key=lambda x: -x["score"])
+    top_sessions = scored_sessions[:MAX_RESULTS]
+
+    # Find related semantic/procedural files
+    if not json_mode:
+        print("Finding related knowledge files...", file=sys.stderr)
+    related_files = find_related_files(memory_root, context_emb)
+
+    # Output
+    output = {
+        "context_source": "active/current-tasks.md" if not context_override else "(override)",
+        "context_preview": context_text[:200].replace("\n", " ").strip(),
+        "similar_sessions": top_sessions,
+        "related_files": related_files,
+    }
+
+    if json_mode:
+        print(json.dumps(output, indent=2))
+    else:
+        print(f"\nContext: {output['context_preview'][:100]}...")
+        print(f"\n{'='*60}")
+        print(f"Top {len(top_sessions)} similar past sessions:")
+        print(f"{'='*60}\n")
+
+        if not top_sessions:
+            print("No similar sessions found.")
+        else:
+            for idx, s in enumerate(top_sessions, 1):
+                heading_str = f" — {s['heading']}" if s["heading"] else ""
+                print(f"{idx}. [{s['score']:.3f}] {s['file']}{heading_str}")
+                if s["date"]:
+                    print(f"   Date: {s['date']}")
+                print(f"   {s['preview'][:200]}")
+                print()
+
+        if related_files:
+            print(f"{'='*60}")
+            print("Related knowledge files:")
+            print(f"{'='*60}\n")
+            for rf in related_files:
+                print(f"  [{rf['score']:.3f}] {rf['file']}")
+                print(f"    {rf['preview'][:150]}")
+                print()
+
+
+if __name__ == "__main__":
+    main()

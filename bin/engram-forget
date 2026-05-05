@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""engram-forget — Mark knowledge as superseded.
+
+Usage:
+    engram forget "topic"                Search and mark matching files as superseded
+    engram forget --file <path>          Mark specific file as superseded
+    engram forget --file <path> --reason "explanation"
+
+Does NOT delete files. Moves them to .archive/ and prepends superseded notice.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import sys
+from datetime import date
+from pathlib import Path
+
+
+def find_memory_root():
+    """Find .claude/memory/ starting from cwd, walking up."""
+    p = Path.cwd()
+    while p != p.parent:
+        candidate = p / ".claude" / "memory"
+        if candidate.is_dir():
+            return candidate
+        p = p.parent
+    return None
+
+
+def search_files(memory_root, topic):
+    """Search memory files for topic matches (filename or content)."""
+    matches = []
+    topic_lower = topic.lower()
+    searchable_layers = ['semantic', 'procedural', 'active']
+
+    for layer in searchable_layers:
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in layer_dir.iterdir():
+            if not f.is_file() or f.name.startswith('.'):
+                continue
+            # Check filename
+            if topic_lower in f.name.lower():
+                matches.append(f)
+                continue
+            # Check content
+            try:
+                content = f.read_text(encoding='utf-8', errors='replace')
+                if topic_lower in content.lower():
+                    matches.append(f)
+            except (OSError, PermissionError):
+                pass
+
+    return matches
+
+
+def supersede_file(filepath, memory_root, reason=None, dry_run=False):
+    """Mark a file as superseded and move to .archive/."""
+    today = date.today().isoformat()
+    rel = filepath.relative_to(memory_root)
+    layer = rel.parts[0]  # e.g., 'semantic', 'procedural'
+
+    # Determine archive path
+    archive_dir = memory_root / layer / ".archive"
+    archive_path = archive_dir / filepath.name
+
+    # Read current content
+    try:
+        content = filepath.read_text(encoding='utf-8', errors='replace')
+    except (OSError, PermissionError) as e:
+        print(f"  Error reading {rel}: {e}", file=sys.stderr)
+        return False
+
+    # Prepend superseded notice
+    notice = f"[SUPERSEDED as of {today}]"
+    if reason:
+        notice += f" Reason: {reason}"
+    notice += "\n\n"
+
+    # Check if already superseded
+    if content.startswith('[SUPERSEDED'):
+        print(f"  Skip (already superseded): {rel}")
+        return False
+
+    new_content = notice + content
+
+    if dry_run:
+        print(f"  Would supersede: {rel}")
+        print(f"    -> {layer}/.archive/{filepath.name}")
+        if reason:
+            print(f"    Reason: {reason}")
+        return True
+
+    # Create archive dir
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write updated content to archive
+    archive_path.write_text(new_content, encoding='utf-8')
+
+    # Remove original
+    filepath.unlink()
+
+    # Update cross-references in remaining files
+    update_references(memory_root, filepath.name, layer)
+
+    print(f"  Superseded: {rel} -> {layer}/.archive/{filepath.name}")
+    return True
+
+
+def update_references(memory_root, filename, original_layer):
+    """Update references pointing to the superseded file."""
+    stem = Path(filename).stem
+    searchable_layers = ['semantic', 'procedural', 'active']
+    patterns = [
+        re.compile(re.escape(filename)),
+        re.compile(r'\[\[' + re.escape(stem) + r'\]\]'),
+    ]
+
+    for layer in searchable_layers:
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+        for f in layer_dir.iterdir():
+            if not f.is_file() or f.name.startswith('.'):
+                continue
+            try:
+                content = f.read_text(encoding='utf-8', errors='replace')
+                modified = False
+                for pat in patterns:
+                    if pat.search(content):
+                        replacement = f"{filename} [SUPERSEDED]"
+                        content = pat.sub(replacement, content)
+                        modified = True
+                if modified:
+                    f.write_text(content, encoding='utf-8')
+                    rel = f.relative_to(memory_root)
+                    print(f"    Updated reference in: {rel}")
+            except (OSError, PermissionError):
+                pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Mark engram knowledge as superseded')
+    parser.add_argument('topic', nargs='?', help='Topic to search for and supersede')
+    parser.add_argument('--file', '-f', help='Specific file path to supersede')
+    parser.add_argument('--reason', '-r', help='Reason for superseding')
+    parser.add_argument('--dry-run', action='store_true', help='Preview without making changes')
+    args = parser.parse_args()
+
+    if not args.topic and not args.file:
+        parser.print_help()
+        sys.exit(1)
+
+    memory_root = find_memory_root()
+    if not memory_root:
+        print("Error: No .claude/memory/ found in current or parent directories.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.file:
+        # Direct file supersede
+        filepath = Path(args.file)
+        if not filepath.is_absolute():
+            filepath = Path.cwd() / filepath
+        if not filepath.is_file():
+            print(f"Error: File not found: {filepath}", file=sys.stderr)
+            sys.exit(1)
+        # Verify it's within memory root
+        try:
+            filepath.relative_to(memory_root)
+        except ValueError:
+            print(f"Error: File is not within memory directory: {memory_root}", file=sys.stderr)
+            sys.exit(1)
+
+        supersede_file(filepath, memory_root, reason=args.reason, dry_run=args.dry_run)
+    else:
+        # Search by topic
+        matches = search_files(memory_root, args.topic)
+        if not matches:
+            print(f"No files matching '{args.topic}' found.")
+            sys.exit(0)
+
+        print(f"Found {len(matches)} file(s) matching '{args.topic}':\n")
+        for i, f in enumerate(matches):
+            rel = f.relative_to(memory_root)
+            print(f"  [{i+1}] {rel}")
+
+        if args.dry_run:
+            print(f"\nDry run — would supersede {len(matches)} file(s):")
+            for f in matches:
+                supersede_file(f, memory_root, reason=args.reason, dry_run=True)
+            return
+
+        print(f"\nSuperseding {len(matches)} file(s):")
+        count = 0
+        for f in matches:
+            if supersede_file(f, memory_root, reason=args.reason, dry_run=False):
+                count += 1
+
+        print(f"\nDone: {count} file(s) superseded.")
+
+
+if __name__ == '__main__':
+    main()

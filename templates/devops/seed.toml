@@ -1,0 +1,8 @@
+# Template: devops
+# Domain: CI/CD, Docker, Kubernetes, infrastructure
+
+[meta]
+name = "devops"
+description = "CI/CD, Docker, Kubernetes, and infrastructure patterns"
+version = "0.1.0"
+tags = ["devops", "docker", "kubernetes", "ci-cd", "infrastructure"]

@@ -135,6 +135,124 @@ class QdrantClient:
         return points, next_offset
 
 
+    def search_hybrid(
+        self,
+        collection: str,
+        vector: list[float],
+        query_text: str,
+        limit: int = 5,
+        score_threshold: Optional[float] = None,
+        filter_: Optional[dict] = None,
+    ) -> list[dict]:
+        """
+        Hybrid search: combine vector similarity + BM25 keyword scoring.
+
+        Uses Qdrant's query API with prefetch for fusion ranking.
+        Falls back to pure vector search if hybrid not supported.
+        """
+        # Try hybrid with RRF (Reciprocal Rank Fusion)
+        try:
+            # First, try the recommend/query endpoint with text matching
+            # Qdrant 1.7+ supports full-text index on payload fields
+            data = {
+                "vector": vector,
+                "limit": limit,
+                "with_payload": True,
+            }
+            if score_threshold is not None:
+                data["score_threshold"] = score_threshold
+            if filter_:
+                data["filter"] = filter_
+
+            # Get vector results
+            vector_results = self._request(
+                "POST", f"/collections/{collection}/points/search", data
+            )
+            vector_hits = vector_results.get("result", [])
+
+            # Get keyword results via scroll + filter (BM25 approximation)
+            # Search in payload "text" and "heading" fields
+            keyword_hits = self._keyword_search(collection, query_text, limit * 2)
+
+            # Fuse results using Reciprocal Rank Fusion (RRF)
+            return self._rrf_fuse(vector_hits, keyword_hits, limit)
+
+        except (QdrantError, Exception):
+            # Fallback to pure vector search
+            return self.search(collection, vector, limit, score_threshold, filter_)
+
+    def _keyword_search(self, collection: str, query: str, limit: int) -> list[dict]:
+        """Approximate keyword search via scroll with payload filtering."""
+        # Split query into keywords
+        keywords = [w.lower() for w in query.split() if len(w) > 2]
+        if not keywords:
+            return []
+
+        # Use scroll to find points whose text contains keywords
+        # This is a simplified BM25 approximation using Qdrant's match conditions
+        results = []
+        for keyword in keywords[:3]:  # Limit to top 3 keywords for performance
+            try:
+                filter_ = {
+                    "should": [
+                        {"key": "text", "match": {"text": keyword}},
+                        {"key": "heading", "match": {"text": keyword}},
+                    ]
+                }
+                points, _ = self.scroll(collection, limit=limit, filter_=filter_)
+                results.extend(points)
+            except QdrantError:
+                continue
+
+        # Deduplicate by ID and score by keyword frequency
+        seen = {}
+        for point in results:
+            pid = point.get("id")
+            if pid not in seen:
+                seen[pid] = {"id": pid, "payload": point.get("payload", {}), "score": 1.0}
+            else:
+                seen[pid]["score"] += 1.0  # More keyword matches = higher score
+
+        # Normalize scores
+        if seen:
+            max_score = max(p["score"] for p in seen.values())
+            for p in seen.values():
+                p["score"] /= max_score
+
+        return sorted(seen.values(), key=lambda x: -x["score"])[:limit]
+
+    def _rrf_fuse(
+        self, vector_hits: list[dict], keyword_hits: list[dict], limit: int, k: int = 60
+    ) -> list[dict]:
+        """
+        Reciprocal Rank Fusion — merge two ranked lists.
+
+        RRF score = sum(1 / (k + rank)) across lists.
+        k=60 is standard constant from the RRF paper.
+        """
+        scores = {}  # id -> {score, payload}
+
+        for rank, hit in enumerate(vector_hits):
+            pid = hit.get("id")
+            rrf_score = 1.0 / (k + rank + 1)
+            if pid not in scores:
+                scores[pid] = {"id": pid, "payload": hit.get("payload", {}), "score": 0.0}
+            scores[pid]["score"] += rrf_score
+            # Preserve original vector score for reference
+            scores[pid]["vector_score"] = hit.get("score", 0)
+
+        for rank, hit in enumerate(keyword_hits):
+            pid = hit.get("id")
+            rrf_score = 1.0 / (k + rank + 1)
+            if pid not in scores:
+                scores[pid] = {"id": pid, "payload": hit.get("payload", {}), "score": 0.0}
+            scores[pid]["score"] += rrf_score
+
+        # Sort by fused score
+        fused = sorted(scores.values(), key=lambda x: -x["score"])[:limit]
+        return fused
+
+
 class QdrantError(Exception):
     """Qdrant operation failed."""
     pass
