@@ -34,6 +34,9 @@ Usage:
   engram end "summary"                     Write lossless checkpoint
   engram search "query" [--chunks] [--json] Search memory (semantic + keyword)
   engram sync <source> <target> [opts]     Sync knowledge between locations
+  engram export [file.tar.gz] [--all]      Export memory for transfer
+  engram import <file.tar.gz> [--merge]    Import memory from archive
+  engram setup [--ollama|--cache|--qdrant] Prepare new system after import
   engram index [--incremental] [--status]  Build/update Qdrant vector index
   engram qdrant <download|start|stop>      Manage Qdrant binary
   engram hooks <install|remove|status>     Manage Claude Code hooks
@@ -75,6 +78,18 @@ case "${1:-}" in
   sync)
     shift
     exec python3 "$BIN_DIR/engram-sync" "$@"
+    ;;
+  export)
+    shift
+    exec "$BIN_DIR/engram-export" "$@"
+    ;;
+  import)
+    shift
+    exec "$BIN_DIR/engram-import" "$@"
+    ;;
+  setup)
+    shift
+    exec "$BIN_DIR/engram-setup" "$@"
     ;;
   index)
     shift

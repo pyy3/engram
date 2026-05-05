@@ -1,0 +1,267 @@
+#!/bin/bash
+# Engram Setup — prepare a new system after import/clone.
+#
+# Usage:
+#   engram setup              # full setup (Ollama model + rebuild cache + Qdrant)
+#   engram setup --ollama     # only pull Ollama embedding model
+#   engram setup --cache      # only rebuild embedding cache
+#   engram setup --qdrant     # only download + populate Qdrant
+#   engram setup --check      # check what's needed without doing anything
+#
+# Run this after:
+#   - Cloning a repo with .claude/memory/
+#   - Running 'engram import'
+#   - Setting up a new machine
+#
+# This command:
+#   1. Ensures Ollama is installed and the embedding model is pulled
+#   2. Rebuilds the file/chunk embedding cache
+#   3. Downloads Qdrant binary (optional) and indexes memory
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
+MEMORY_ROOT=".claude/memory"
+EMBEDDING_MODEL="${ENGRAM_MODEL:-nomic-embed-text}"
+OLLAMA_URL="${ENGRAM_OLLAMA_URL:-http://127.0.0.1:11434}"
+
+usage() {
+  cat << 'EOF'
+Engram Setup — prepare a new system for memory search
+
+Usage:
+  engram setup              Full setup (Ollama + cache + optional Qdrant)
+  engram setup --ollama     Only pull Ollama embedding model
+  engram setup --cache      Only rebuild embedding cache
+  engram setup --qdrant     Only setup Qdrant (download + index)
+  engram setup --check      Check what's needed (no changes)
+
+Run this after cloning a repo or importing memory to a new machine.
+EOF
+}
+
+check_ollama() {
+  if curl -s -o /dev/null "$OLLAMA_URL" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+check_model() {
+  local models
+  models=$(curl -s "$OLLAMA_URL/api/tags" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for m in data.get('models', []):
+        print(m['name'].split(':')[0])
+except: pass
+" 2>/dev/null)
+  echo "$models" | grep -q "^${EMBEDDING_MODEL}$"
+}
+
+setup_ollama() {
+  echo "=== Ollama Setup ==="
+  echo ""
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    echo "Ollama not installed."
+    echo ""
+    echo "Install Ollama:"
+    echo "  curl -fsSL https://ollama.com/install.sh | sh"
+    echo ""
+    echo "Or visit: https://ollama.com"
+    return 1
+  fi
+
+  if ! check_ollama; then
+    echo "Ollama installed but not running. Starting..."
+    ollama serve >/dev/null 2>&1 &
+    sleep 2
+    if ! check_ollama; then
+      echo "Failed to start Ollama. Start manually: ollama serve"
+      return 1
+    fi
+    echo "Ollama started."
+  else
+    echo "Ollama: running"
+  fi
+
+  if check_model; then
+    echo "Model '$EMBEDDING_MODEL': already available"
+  else
+    echo "Pulling model: $EMBEDDING_MODEL..."
+    ollama pull "$EMBEDDING_MODEL"
+    echo "Model ready."
+  fi
+
+  echo ""
+}
+
+setup_cache() {
+  echo "=== Embedding Cache Rebuild ==="
+  echo ""
+
+  if [ ! -d "$MEMORY_ROOT" ]; then
+    echo "No memory found. Run 'engram init' or 'engram import' first."
+    return 1
+  fi
+
+  if ! check_ollama; then
+    echo "Ollama not running. Run 'engram setup --ollama' first."
+    return 1
+  fi
+
+  # Clear stale cache
+  if [ -d "$MEMORY_ROOT/.cache" ]; then
+    rm -rf "$MEMORY_ROOT/.cache"
+    echo "Cleared stale cache."
+  fi
+
+  # Count files to process
+  local file_count
+  file_count=$(find "$MEMORY_ROOT" -name "*.md" -type f -not -path "*/.cache/*" 2>/dev/null | wc -l)
+  echo "Files to embed: $file_count"
+  echo ""
+
+  # Trigger cache rebuild by searching for a common term
+  echo "Building embeddings (this may take 30-60s for large memory stores)..."
+  python3 "$SCRIPT_DIR/engram-search" "project setup" --json > /dev/null 2>&1 || true
+
+  # Check result
+  if [ -f "$MEMORY_ROOT/.cache/_file_embeddings.json" ]; then
+    local cached
+    cached=$(python3 -c "import json; print(len(json.load(open('$MEMORY_ROOT/.cache/_file_embeddings.json'))))" 2>/dev/null || echo "0")
+    echo "Cache rebuilt: $cached files embedded"
+  else
+    echo "Warning: cache not created. Check Ollama is running with '$EMBEDDING_MODEL' model."
+  fi
+
+  echo ""
+}
+
+setup_qdrant() {
+  echo "=== Qdrant Setup ==="
+  echo ""
+
+  local qdrant_bin="$ENGRAM_HOME/qdrant/qdrant"
+
+  if [ ! -f "$qdrant_bin" ]; then
+    echo "Downloading Qdrant..."
+    bash "$SCRIPT_DIR/engram-qdrant" download
+    echo ""
+  else
+    echo "Qdrant binary: installed"
+  fi
+
+  # Start if not running
+  if ! curl -s -o /dev/null "http://127.0.0.1:6333/healthz" 2>/dev/null; then
+    echo "Starting Qdrant..."
+    bash "$SCRIPT_DIR/engram-qdrant" start
+    echo ""
+  else
+    echo "Qdrant: already running"
+  fi
+
+  # Index memory
+  if [ -d "$MEMORY_ROOT" ]; then
+    echo "Indexing memory into Qdrant..."
+    python3 "$SCRIPT_DIR/engram-index" 2>&1
+  fi
+
+  echo ""
+}
+
+run_check() {
+  echo "=== Engram System Check ==="
+  echo ""
+
+  # Ollama
+  if check_ollama; then
+    echo "  [ok] Ollama: running"
+    if check_model; then
+      echo "  [ok] Model '$EMBEDDING_MODEL': available"
+    else
+      echo "  [!!] Model '$EMBEDDING_MODEL': not pulled"
+      echo "       Fix: engram setup --ollama"
+    fi
+  else
+    echo "  [!!] Ollama: not running"
+    echo "       Fix: engram setup --ollama"
+  fi
+
+  # Memory
+  if [ -d "$MEMORY_ROOT" ]; then
+    local file_count
+    file_count=$(find "$MEMORY_ROOT" -name "*.md" -type f -not -path "*/.cache/*" 2>/dev/null | wc -l)
+    echo "  [ok] Memory: $file_count files"
+  else
+    echo "  [!!] Memory: not initialized"
+    echo "       Fix: engram init"
+  fi
+
+  # Cache
+  if [ -f "$MEMORY_ROOT/.cache/_file_embeddings.json" ]; then
+    local cached
+    cached=$(python3 -c "import json; print(len(json.load(open('$MEMORY_ROOT/.cache/_file_embeddings.json'))))" 2>/dev/null || echo "0")
+    echo "  [ok] Cache: $cached files embedded"
+  else
+    echo "  [--] Cache: not built"
+    echo "       Fix: engram setup --cache"
+  fi
+
+  # Qdrant
+  if curl -s -o /dev/null "http://127.0.0.1:6333/healthz" 2>/dev/null; then
+    echo "  [ok] Qdrant: running"
+  else
+    local qdrant_bin="$ENGRAM_HOME/qdrant/qdrant"
+    if [ -f "$qdrant_bin" ]; then
+      echo "  [--] Qdrant: installed but not running"
+      echo "       Fix: engram qdrant start"
+    else
+      echo "  [--] Qdrant: not installed (optional)"
+      echo "       Fix: engram setup --qdrant"
+    fi
+  fi
+
+  echo ""
+}
+
+# Main
+case "${1:-}" in
+  --ollama)  setup_ollama ;;
+  --cache)   setup_cache ;;
+  --qdrant)  setup_qdrant ;;
+  --check)   run_check ;;
+  --help|-h) usage ;;
+  "")
+    # Full setup
+    setup_ollama
+    setup_cache
+
+    echo "---"
+    echo ""
+    echo "Core setup complete! Semantic search is ready."
+    echo ""
+
+    read -p "Also set up Qdrant vector DB? (optional, adds faster search) [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      setup_qdrant
+    else
+      echo "Skipped Qdrant. You can add it later: engram setup --qdrant"
+    fi
+
+    echo ""
+    echo "=== Setup Complete ==="
+    echo ""
+    echo "Start a session:"
+    echo "  engram start \"your topic\""
+    ;;
+  *)
+    echo "Unknown option: $1"
+    usage
+    exit 1
+    ;;
+esac

@@ -1,0 +1,99 @@
+#!/bin/bash
+# Engram Export — package memory for transfer to another system.
+#
+# Usage:
+#   engram export                          # export to engram-memory-YYYY-MM-DD.tar.gz
+#   engram export my-backup.tar.gz         # export to specific file
+#   engram export --all                    # include lossless layer
+#
+# What's included (default):
+#   - semantic/    (distilled facts)
+#   - procedural/  (workflows)
+#   - active/      (current tasks)
+#
+# What's excluded:
+#   - .cache/      (machine-specific embeddings, rebuilds automatically)
+#   - lossless/    (large, append-only history — use --all to include)
+
+set -euo pipefail
+
+MEMORY_ROOT=".claude/memory"
+
+if [ ! -d "$MEMORY_ROOT" ]; then
+  echo "Error: $MEMORY_ROOT not found. Run 'engram init' first."
+  exit 1
+fi
+
+# Parse args
+INCLUDE_ALL=false
+OUTPUT=""
+for arg in "$@"; do
+  case "$arg" in
+    --all) INCLUDE_ALL=true ;;
+    --help|-h)
+      echo "Usage: engram export [output.tar.gz] [--all]"
+      echo ""
+      echo "Options:"
+      echo "  --all    Include lossless layer (session history)"
+      echo ""
+      echo "Default output: engram-memory-YYYY-MM-DD.tar.gz"
+      exit 0
+      ;;
+    *) OUTPUT="$arg" ;;
+  esac
+done
+
+# Default output filename
+if [ -z "$OUTPUT" ]; then
+  PROJECT_NAME=$(basename "$(pwd)" | tr ' ' '-')
+  OUTPUT="engram-memory-${PROJECT_NAME}-$(date +%Y-%m-%d).tar.gz"
+fi
+
+# Build list of paths to include
+PATHS=()
+for layer in semantic procedural active; do
+  if [ -d "$MEMORY_ROOT/$layer" ]; then
+    PATHS+=("$MEMORY_ROOT/$layer")
+  fi
+done
+
+if [ "$INCLUDE_ALL" = true ] && [ -d "$MEMORY_ROOT/lossless" ]; then
+  PATHS+=("$MEMORY_ROOT/lossless")
+fi
+
+# Include .gitignore and any root-level memory config
+if [ -f "$MEMORY_ROOT/.gitignore" ]; then
+  PATHS+=("$MEMORY_ROOT/.gitignore")
+fi
+
+if [ ${#PATHS[@]} -eq 0 ]; then
+  echo "Nothing to export — memory layers are empty."
+  exit 1
+fi
+
+# Create archive
+tar -czf "$OUTPUT" "${PATHS[@]}" 2>/dev/null
+
+# Report
+SIZE=$(du -h "$OUTPUT" | cut -f1)
+FILE_COUNT=$(tar -tzf "$OUTPUT" | wc -l)
+
+echo "Exported: $OUTPUT ($SIZE, $FILE_COUNT files)"
+echo ""
+echo "Layers included:"
+for layer in semantic procedural active; do
+  if [ -d "$MEMORY_ROOT/$layer" ]; then
+    count=$(find "$MEMORY_ROOT/$layer" -name "*.md" -type f 2>/dev/null | wc -l)
+    printf "  %-12s %d files\n" "$layer/" "$count"
+  fi
+done
+if [ "$INCLUDE_ALL" = true ] && [ -d "$MEMORY_ROOT/lossless" ]; then
+  count=$(find "$MEMORY_ROOT/lossless" -name "*.md" -type f 2>/dev/null | wc -l)
+  printf "  %-12s %d files\n" "lossless/" "$count"
+fi
+
+echo ""
+echo "Excluded: .cache/ (embeddings rebuild automatically on import)"
+echo ""
+echo "To import on another machine:"
+echo "  engram import $OUTPUT"
