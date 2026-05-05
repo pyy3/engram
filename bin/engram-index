@@ -32,7 +32,7 @@ from qdrant import QdrantClient, QdrantError
 QDRANT_URL = os.environ.get("ENGRAM_QDRANT_URL", "http://127.0.0.1:6333")
 OLLAMA_URL = os.environ.get("ENGRAM_OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
 EMBEDDING_MODEL = os.environ.get("ENGRAM_MODEL", "nomic-embed-text")
-VECTOR_SIZE = 384  # nomic-embed-text dimension
+VECTOR_SIZE = 768  # nomic-embed-text dimension
 CHUNK_THRESHOLD = 200
 MAX_CHUNK_CHARS = 1800
 

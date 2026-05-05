@@ -39,9 +39,12 @@ class QdrantClient:
     def healthy(self) -> bool:
         """Check if Qdrant is running and healthy."""
         try:
-            self._request("GET", "/healthz")
-            return True
-        except (QdrantError, OSError):
+            url = f"{self.url}/healthz"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = resp.read().decode()
+                return "passed" in body or resp.status == 200
+        except (OSError, Exception):
             return False
 
     def collection_exists(self, name: str) -> bool:
