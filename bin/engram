@@ -54,8 +54,17 @@ Usage:
   engram diff [DATE1 DATE2] [--last N]     Show changes between checkpoints
   engram forget "topic" [--file PATH]      Mark knowledge as superseded
   engram compact [--older-than DAYS]       Merge old lossless into summaries
+  engram tag <file> [--confidence C] [--urgency U] [--domain D] [--tags T]
+  engram gaps [--fill Q] [--dismiss Q] [--stats] [--json]
+  engram contradict "topic" [--scan] [--list] [--resolve ID]
   engram stats [--project P] [--days N]    Usage analytics (SQLite)
   engram log <op> <layer> <path> <bytes>   Record a usage event
+  engram login [--api-key KEY]             Sign up or log in to Engram Cloud
+  engram logout                            Remove stored credentials
+  engram link --store <name>               Link project to a cloud memory store
+  engram push [--layer L] [--dry-run]      Push local memory to cloud
+  engram pull [--dry-run]                  Pull cloud changes to local
+  engram cloud status                      Show cloud sync status
   engram status                            Show memory layer stats
   engram version                           Print version
 
@@ -193,6 +202,45 @@ case "${1:-}" in
   compact)
     shift
     exec python3 "$BIN_DIR/engram-compact" "$@"
+    ;;
+  tag)
+    shift
+    exec python3 "$BIN_DIR/engram-tag" "$@"
+    ;;
+  gaps)
+    shift
+    exec python3 "$BIN_DIR/engram-gaps" "$@"
+    ;;
+  contradict)
+    shift
+    exec python3 "$BIN_DIR/engram-contradict" "$@"
+    ;;
+  login)
+    shift
+    exec "$BIN_DIR/engram-login" "$@"
+    ;;
+  logout)
+    shift
+    exec "$BIN_DIR/engram-logout" "$@"
+    ;;
+  link)
+    shift
+    exec "$BIN_DIR/engram-link" "$@"
+    ;;
+  push)
+    shift
+    exec python3 "$BIN_DIR/engram-push" "$@"
+    ;;
+  pull)
+    shift
+    exec python3 "$BIN_DIR/engram-pull" "$@"
+    ;;
+  cloud)
+    shift
+    case "${1:-}" in
+      status) shift; exec "$BIN_DIR/engram-cloud-status" "$@" ;;
+      *)      exec "$BIN_DIR/engram-cloud-status" "$@" ;;
+    esac
     ;;
   version|--version|-v)
     echo "engram $VERSION"

@@ -1,0 +1,95 @@
+#!/bin/bash
+# Engram Cloud — Show cloud sync status.
+#
+# Usage: engram cloud status
+
+set -euo pipefail
+
+CRED_FILE="$HOME/.config/engram/credentials.json"
+MEMORY_ROOT=".claude/memory"
+LINK_FILE="$MEMORY_ROOT/.engram-cloud.json"
+STATE_FILE="$MEMORY_ROOT/.engram-push-state.json"
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+# --- check prerequisites ---------------------------------------------------
+
+if [ ! -f "$CRED_FILE" ]; then
+  echo "Cloud: not logged in"
+  echo "  Run: engram login"
+  exit 0
+fi
+
+if [ ! -f "$LINK_FILE" ]; then
+  echo "Cloud: not linked"
+  echo "  Run: engram link --store <name>"
+  exit 0
+fi
+
+# --- load config (read JSON via stdin to avoid path injection) --------------
+
+read_json_fields() {
+  python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for key in sys.argv[1:]:
+    print(d.get(key, ''))
+" "$@"
+}
+
+CRED_VALUES=$(read_json_fields api_key server < "$CRED_FILE")
+API_KEY=$(echo "$CRED_VALUES" | head -1)
+SERVER=$(echo "$CRED_VALUES" | sed -n '2p')
+SERVER="${SERVER%/}"
+
+LINK_VALUES=$(read_json_fields store_id store_name device_id linked_at < "$LINK_FILE")
+STORE_ID=$(echo "$LINK_VALUES" | head -1)
+STORE_NAME=$(echo "$LINK_VALUES" | sed -n '2p')
+DEVICE_ID=$(echo "$LINK_VALUES" | sed -n '3p')
+LINKED_AT=$(echo "$LINK_VALUES" | sed -n '4p')
+DEVICE_ID="${DEVICE_ID:-default}"
+
+LOCAL_VERSION=0
+if [ -f "$STATE_FILE" ]; then
+  LOCAL_VERSION=$(read_json_fields version < "$STATE_FILE")
+fi
+
+# --- fetch server status ---------------------------------------------------
+
+echo "Engram Cloud Status"
+echo "===================="
+echo ""
+echo "  Store:    $STORE_NAME ($STORE_ID)"
+echo "  Server:   $SERVER"
+echo "  Linked:   $LINKED_AT"
+echo "  Local v:  $LOCAL_VERSION"
+
+RESP=$(curl -s --connect-timeout 10 --max-time 15 -w "\n%{http_code}" \
+  -H "Authorization: Bearer $API_KEY" \
+  "$SERVER/api/v1/sync/$STORE_ID/status?device_id=$DEVICE_ID" 2>/dev/null)
+
+HTTP_CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+
+if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
+  REMOTE_VALUES=$(echo "$BODY" | read_json_fields latest_version behind)
+  REMOTE_VERSION=$(echo "$REMOTE_VALUES" | head -1)
+  BEHIND=$(echo "$REMOTE_VALUES" | sed -n '2p')
+
+  echo "  Remote v: $REMOTE_VERSION"
+  echo ""
+
+  if [[ "$BEHIND" -gt 0 ]]; then
+    echo "  Status: $BEHIND version(s) behind — run 'engram pull'"
+  elif [[ "$LOCAL_VERSION" -eq "$REMOTE_VERSION" ]]; then
+    echo "  Status: up to date"
+  else
+    echo "  Status: synced (remote v$REMOTE_VERSION)"
+  fi
+elif [[ "$HTTP_CODE" == "401" ]]; then
+  echo ""
+  echo "  Status: authentication failed — run 'engram login'"
+else
+  echo ""
+  echo "  Status: server unreachable ($HTTP_CODE)"
+fi

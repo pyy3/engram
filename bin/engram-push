@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""
+Engram Cloud — Push local memory files to the cloud.
+
+Usage:
+  engram push                    Push all layers
+  engram push --layer semantic   Push specific layer
+  engram push --dry-run          Preview without uploading
+
+Reads cloud link from .claude/memory/.engram-cloud.json
+and credentials from ~/.config/engram/credentials.json.
+"""
+
+import hashlib
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+MEMORY_ROOT = Path(".claude/memory")
+LINK_FILE = MEMORY_ROOT / ".engram-cloud.json"
+CRED_FILE = Path.home() / ".config" / "engram" / "credentials.json"
+SYNC_LAYERS = ["semantic", "procedural", "lossless", "active"]
+STATE_FILE = MEMORY_ROOT / ".engram-push-state.json"
+
+
+def die(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config():
+    if not CRED_FILE.exists():
+        die("Not logged in. Run 'engram login' first.")
+    if not LINK_FILE.exists():
+        die("Project not linked. Run 'engram link --store <name>' first.")
+
+    creds = json.loads(CRED_FILE.read_text())
+    link = json.loads(LINK_FILE.read_text())
+    return {
+        "api_key": creds["api_key"],
+        "server": creds["server"].rstrip("/"),
+        "store_id": link["store_id"],
+        "device_id": link.get("device_id", creds.get("device_id", "default")),
+    }
+
+
+def file_hash(content: str) -> str:
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def load_push_state() -> dict:
+    """Load previously-pushed file hashes to detect local changes."""
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"hashes": {}, "version": 0}
+
+
+def save_push_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def scan_local_files(layers: list) -> list:
+    """Scan local memory layers and return list of (layer, path, content, hash)."""
+    files = []
+    for layer in layers:
+        layer_dir = MEMORY_ROOT / layer
+        if not layer_dir.is_dir():
+            continue
+        for fpath in sorted(layer_dir.rglob("*")):
+            if fpath.is_dir():
+                continue
+            if ".cache" in str(fpath):
+                continue
+            # Skip hidden files except known ones
+            if fpath.name.startswith(".") and not fpath.name.endswith(".jsonl"):
+                continue
+            rel = str(fpath.relative_to(MEMORY_ROOT / layer))
+            try:
+                content = fpath.read_text(errors="replace")
+            except Exception:
+                continue
+            h = file_hash(content)
+            files.append((layer, rel, content, h))
+    return files
+
+
+def api_request(config: dict, method: str, path: str, body=None):
+    """Make an authenticated API request."""
+    url = f"{config['server']}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {config['api_key']}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode() if e.fp else ""
+        try:
+            err = json.loads(body_text)
+        except Exception:
+            err = {"error": body_text}
+        return e.code, err
+    except urllib.error.URLError as e:
+        die(f"Network error: {e.reason}")
+
+
+def get_sync_status(config: dict) -> dict:
+    """Get current sync version from server."""
+    path = f"/api/v1/sync/{config['store_id']}/status?device_id={config['device_id']}"
+    status, data = api_request(config, "GET", path)
+    if status != 200:
+        die(f"Failed to get sync status: {data}")
+    return data
+
+
+def push_changes(config: dict, changes: list, base_version: int) -> dict:
+    """Push changes to the server."""
+    path = f"/api/v1/sync/{config['store_id']}/push"
+    body = {
+        "device_id": config["device_id"],
+        "base_version": base_version,
+        "changes": changes,
+    }
+    status, data = api_request(config, "POST", path, body)
+    if status == 409:
+        die("Server has newer changes. Run 'engram pull' first.")
+    if status < 200 or status >= 300:
+        die(f"Push failed ({status}): {data}")
+    return data
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    layer_filter = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--layer" and i + 1 < len(args):
+            layer_filter = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    if not MEMORY_ROOT.is_dir():
+        die("Engram not initialized. Run 'engram init' first.")
+
+    config = load_config()
+    layers = [layer_filter] if layer_filter else SYNC_LAYERS
+
+    # Load previous push state
+    state = load_push_state()
+    prev_hashes = state.get("hashes", {})
+
+    # Scan local files
+    local_files = scan_local_files(layers)
+    print(f"Scanned {len(local_files)} files across {', '.join(layers)}")
+
+    # Determine changes (new or modified since last push)
+    changes = []
+    for layer, path, content, h in local_files:
+        key = f"{layer}/{path}"
+        if prev_hashes.get(key) != h:
+            changes.append({
+                "layer": layer,
+                "path": path,
+                "content": content,
+                "content_hash": h,
+                "operation": "create" if key not in prev_hashes else "update",
+            })
+
+    if not changes:
+        print("Nothing to push — all files are up to date.")
+        return
+
+    print(f"Changes: {len(changes)} files to push")
+    for c in changes:
+        op = "+" if c["operation"] == "create" else "~"
+        print(f"  {op} {c['layer']}/{c['path']}")
+
+    if dry_run:
+        print("\nDry run — no changes pushed.")
+        return
+
+    # Get current server version
+    sync_status = get_sync_status(config)
+    base_version = sync_status.get("latest_version", 0)
+
+    # Push in batches of 50
+    BATCH_SIZE = 50
+    total_applied = 0
+    new_version = base_version
+
+    for i in range(0, len(changes), BATCH_SIZE):
+        batch = changes[i:i + BATCH_SIZE]
+        result = push_changes(config, batch, new_version)
+        applied = result.get("applied", [])
+        total_applied += len(applied)
+        new_version = result.get("version", new_version)
+        if len(changes) > BATCH_SIZE:
+            print(f"  Pushed batch {i // BATCH_SIZE + 1}: {len(applied)} files")
+
+    # Update push state with new hashes
+    new_hashes = dict(prev_hashes)
+    for layer, path, content, h in local_files:
+        new_hashes[f"{layer}/{path}"] = h
+    save_push_state({"hashes": new_hashes, "version": new_version})
+
+    print(f"\nPushed {total_applied} files. Server version: {new_version}")
+
+
+if __name__ == "__main__":
+    main()

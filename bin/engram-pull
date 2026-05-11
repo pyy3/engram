@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+Engram Cloud — Pull cloud changes to local memory.
+
+Usage:
+  engram pull                    Pull all pending changes
+  engram pull --dry-run          Preview without writing files
+
+Reads cloud link from .claude/memory/.engram-cloud.json
+and credentials from ~/.config/engram/credentials.json.
+"""
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+MEMORY_ROOT = Path(".claude/memory")
+LINK_FILE = MEMORY_ROOT / ".engram-cloud.json"
+CRED_FILE = Path.home() / ".config" / "engram" / "credentials.json"
+STATE_FILE = MEMORY_ROOT / ".engram-push-state.json"
+
+VALID_LAYERS = {"active", "semantic", "procedural", "lossless"}
+
+
+def die(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config():
+    if not CRED_FILE.exists():
+        die("Not logged in. Run 'engram login' first.")
+    if not LINK_FILE.exists():
+        die("Project not linked. Run 'engram link --store <name>' first.")
+
+    creds = json.loads(CRED_FILE.read_text())
+    link = json.loads(LINK_FILE.read_text())
+    return {
+        "api_key": creds["api_key"],
+        "server": creds["server"].rstrip("/"),
+        "store_id": link["store_id"],
+        "device_id": link.get("device_id", creds.get("device_id", "default")),
+    }
+
+
+def load_push_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"hashes": {}, "version": 0}
+
+
+def save_push_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def validate_path(layer: str, path: str) -> bool:
+    """Reject path traversal attempts."""
+    if layer not in VALID_LAYERS:
+        return False
+    if ".." in path or path.startswith("/"):
+        return False
+    # Resolve and ensure it stays within MEMORY_ROOT
+    resolved = (MEMORY_ROOT / layer / path).resolve()
+    memory_resolved = MEMORY_ROOT.resolve()
+    if not str(resolved).startswith(str(memory_resolved)):
+        return False
+    return True
+
+
+def api_request(config: dict, method: str, path: str, body=None):
+    url = f"{config['server']}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {config['api_key']}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode() if e.fp else ""
+        try:
+            err = json.loads(body_text)
+        except Exception:
+            err = {"error": body_text}
+        return e.code, err
+    except urllib.error.URLError as e:
+        die(f"Network error: {e.reason}")
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+
+    if not MEMORY_ROOT.is_dir():
+        die("Engram not initialized. Run 'engram init' first.")
+
+    config = load_config()
+
+    # Get current sync state
+    state = load_push_state()
+    local_version = state.get("version", 0)
+
+    # Check what's available
+    status_path = f"/api/v1/sync/{config['store_id']}/status?device_id={config['device_id']}"
+    status_code, status_data = api_request(config, "GET", status_path)
+    if status_code != 200:
+        die(f"Failed to get sync status: {status_data}")
+
+    latest = status_data.get("latest_version", 0)
+    behind = latest - local_version
+
+    if behind <= 0:
+        print("Already up to date.")
+        return
+
+    print(f"Pulling {behind} version(s) (local: {local_version}, remote: {latest})")
+
+    # Pull changes
+    pull_path = (
+        f"/api/v1/sync/{config['store_id']}/pull"
+        f"?device_id={config['device_id']}&since_version={local_version}"
+    )
+    pull_code, pull_data = api_request(config, "GET", pull_path)
+    if pull_code != 200:
+        die(f"Pull failed: {pull_data}")
+
+    changes = pull_data.get("changes", [])
+    if not changes:
+        print("No changes to apply.")
+        return
+
+    # Apply changes
+    created = 0
+    updated = 0
+    deleted = 0
+
+    for change in changes:
+        operation = change.get("operation", "create")
+        layer = change.get("layer", "")
+        path = change.get("path", "")
+        content = change.get("content", "")
+
+        if not layer or not path:
+            continue
+
+        # Validate path to prevent traversal attacks
+        if not validate_path(layer, path):
+            print(f"  ! skipping unsafe path: {layer}/{path}", file=sys.stderr)
+            continue
+
+        local_path = MEMORY_ROOT / layer / path
+
+        if operation == "delete":
+            if dry_run:
+                print(f"  - {layer}/{path}")
+            elif local_path.exists():
+                local_path.unlink()
+            deleted += 1
+        else:
+            # Check existence BEFORE writing to get accurate counters
+            is_new = not local_path.exists()
+            if dry_run:
+                op = "+" if is_new else "~"
+                print(f"  {op} {layer}/{path}")
+            else:
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_text(content)
+            if is_new:
+                created += 1
+            else:
+                updated += 1
+
+    if dry_run:
+        print(f"\nDry run — {created} new, {updated} updated, {deleted} deleted")
+        return
+
+    # Update local state
+    new_version = pull_data.get("version", latest)
+    state["version"] = new_version
+    # Update hashes for pulled files
+    hashes = state.get("hashes", {})
+    for change in changes:
+        layer = change.get("layer", "")
+        path = change.get("path", "")
+        h = change.get("content_hash", "")
+        if layer and path:
+            key = f"{layer}/{path}"
+            if change.get("operation") == "delete":
+                hashes.pop(key, None)
+            else:
+                hashes[key] = h
+    state["hashes"] = hashes
+    save_push_state(state)
+
+    print(f"\nPulled {len(changes)} changes. Local version: {new_version}")
+    if created:
+        print(f"  {created} new files")
+    if updated:
+        print(f"  {updated} updated files")
+    if deleted:
+        print(f"  {deleted} deleted files")
+
+
+if __name__ == "__main__":
+    main()
