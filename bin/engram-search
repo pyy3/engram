@@ -140,7 +140,7 @@ def get_embedding(text: str) -> list:
 
 
 def cosine_similarity(a, b):
-    if not a or not b:
+    if not a or not b or len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
@@ -633,6 +633,9 @@ def search(query: str, memory_root: Path, force_chunks: bool = False, limit: int
         result["message"] = "Could not embed query (Ollama unavailable?). Keyword results only."
         return result
 
+    # Stash for downstream use (gap tracking); stripped before JSON output
+    result["_query_embedding"] = query_emb
+
     # Try Qdrant first (fast path if available)
     qdrant_results = _try_qdrant_search(query, query_emb, limit)
     if qdrant_results:
@@ -843,8 +846,8 @@ def _track_gaps(result: dict, query: str, memory_root: Path) -> str | None:
         for f in result.get("files", []):
             best = max(best, f.get("score", 0))
 
-        # Try to get query embedding for future similarity matching
-        query_emb = get_embedding(query) if query else []
+        # Reuse query embedding from search result if available, else compute
+        query_emb = result.get("_query_embedding") or (get_embedding(query) if query else [])
 
         # Check for embedding-based match before recording new gap
         if query_emb:
@@ -872,18 +875,20 @@ def _filter_by_domain(result: dict, domain: str, memory_root: Path = None) -> di
             fp = Path(file_path_str)
             if not fp.is_absolute() and memory_root:
                 fp = memory_root.parent / file_path_str
-            if fp.exists():
-                fm = parse_frontmatter(fp.read_text(encoding="utf-8", errors="ignore"))
-                file_domain = str(fm.get("domain", "")).lower()
-                file_tags = fm.get("tags", [])
-                if isinstance(file_tags, list):
-                    file_tags = [str(t).lower() for t in file_tags]
-                else:
-                    file_tags = []
-                return domain in file_domain or domain in file_tags
-        except Exception:
-            pass
-        return False
+            if not fp.exists():
+                return False
+            fm = parse_frontmatter(fp.read_text(encoding="utf-8", errors="ignore"))
+            file_domain = str(fm.get("domain", "")).lower()
+            file_tags = fm.get("tags", [])
+            if isinstance(file_tags, list):
+                file_tags = [str(t).lower() for t in file_tags]
+            else:
+                file_tags = []
+            # Substring match for both domain field and tags
+            return domain in file_domain or any(domain in t for t in file_tags)
+        except (OSError, PermissionError) as e:
+            print(f"Warning: could not read {file_path_str}: {e}", file=sys.stderr)
+            return False
 
     result["chunks"] = [c for c in result.get("chunks", []) if _file_matches(c.get("file", ""))]
     result["files"] = [f for f in result.get("files", []) if _file_matches(f.get("file", ""))]
@@ -957,6 +962,9 @@ def main():
     # Apply date filter
     if since:
         result = filter_by_date(result, since)
+
+    # Strip internal fields before output
+    result.pop("_query_embedding", None)
 
     if json_mode:
         if gap_note:

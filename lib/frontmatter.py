@@ -39,11 +39,17 @@ def strip_frontmatter(content: str) -> str:
 
 
 def render_frontmatter(meta: dict) -> str:
-    """Render a dict as a YAML frontmatter block (--- delimited)."""
+    """Render a dict as a YAML frontmatter block (--- delimited).
+
+    Note: 'yes'/'no' strings round-trip as booleans (YAML 1.1 convention).
+    Quote them if you need literal strings: \"'yes'\", \"'no'\".
+    """
     if not meta:
         return ""
     lines = ["---"]
     for key, value in meta.items():
+        if value is None:
+            continue
         lines.append(f"{key}: {_format_value(value)}")
     lines.append("---\n")
     return "\n".join(lines)

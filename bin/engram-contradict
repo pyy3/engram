@@ -72,7 +72,7 @@ def get_embedding(text: str) -> list:
 
 
 def cosine_similarity(a: list, b: list) -> float:
-    if not a or not b:
+    if not a or not b or len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
@@ -219,16 +219,14 @@ class ContradictionStore:
 
     def _save_all(self, records: list[dict]):
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.store_path, "w", encoding="utf-8") as f:
+        tmp = self.store_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
+        os.replace(str(tmp), str(self.store_path))
 
     def _next_id(self) -> str:
-        date = datetime.now().strftime("%Y%m%d")
-        records = self._load()
-        today = [r for r in records if r.get("id", "").startswith(f"c-{date}")]
-        seq = len(today) + 1
-        return f"c-{date}-{seq:03d}"
+        return f"c-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
 
     def record(self, file_a: str, file_b: str, similarity: float, hit: dict) -> dict:
         rec = {
@@ -349,11 +347,17 @@ def scan_all(memory_root: Path) -> list[dict]:
         print("No files to scan.")
         return []
 
-    print(f"Scanning {len(files)} files for contradictions...")
+    n = len(files)
+    total_pairs = n * (n - 1) // 2
+    print(f"Scanning {n} files ({total_pairs} pairs) for contradictions...")
     found = []
+    checked = 0
 
-    for i in range(len(files)):
-        for j in range(i + 1, len(files)):
+    for i in range(n):
+        for j in range(i + 1, n):
+            checked += 1
+            if checked % 50 == 0:
+                print(f"  Progress: {checked}/{total_pairs} pairs checked...", end="\r")
             hits = check_pair(files[i]["text"], files[j]["text"])
             for hit in hits:
                 if not store.is_duplicate(files[i]["rel"], files[j]["rel"], hit["signal"]):
@@ -363,18 +367,67 @@ def scan_all(memory_root: Path) -> list[dict]:
                     print(f"    A: {hit['snippet_a'][:100]}")
                     print(f"    B: {hit['snippet_b'][:100]}")
 
+    if total_pairs >= 50:
+        print(f"  Progress: {total_pairs}/{total_pairs} pairs checked.   ")
+
     return found
 
 
 def check_file(file_path: str, memory_root: Path, quiet: bool = False) -> list[dict]:
-    """Check a specific file against existing memory."""
+    """Check a specific file against existing memory files."""
     fp = Path(file_path)
     if not fp.exists():
         return []
-    content = fp.read_text(encoding="utf-8", errors="ignore")
-    # Use content as topic for finding relevant files
-    # Take first 500 chars as representative
-    return scan_topic(content[:500], memory_root, quiet=quiet)
+    new_content = fp.read_text(encoding="utf-8", errors="ignore")
+    if not new_content.strip():
+        return []
+
+    store = ContradictionStore(memory_root)
+    files = _collect_files(memory_root)
+    if not files:
+        return []
+
+    # Find files relevant to the new content via embedding similarity
+    new_emb = get_embedding(new_content[:2000])
+    relevant = []
+
+    if new_emb:
+        for f in files:
+            # Skip the file itself
+            if f["path"].resolve() == fp.resolve():
+                continue
+            f_emb = get_embedding(f["text"][:2000])
+            if f_emb:
+                sim = cosine_similarity(new_emb, f_emb)
+                if sim > SIM_THRESHOLD:
+                    relevant.append((sim, f))
+        relevant.sort(key=lambda x: -x[0])
+        relevant = relevant[:10]
+    else:
+        # Keyword fallback
+        words = {w.lower() for w in new_content.split()[:100] if len(w) > 3}
+        for f in files:
+            if f["path"].resolve() == fp.resolve():
+                continue
+            f_lower = f["text"].lower()
+            if sum(1 for w in words if w in f_lower) >= 3:
+                relevant.append((0.5, f))
+
+    # Compare the new content against each relevant file
+    found = []
+    new_rel = str(fp)
+    for sim, existing_file in relevant:
+        hits = check_pair(new_content, existing_file["text"])
+        for hit in hits:
+            if not store.is_duplicate(new_rel, existing_file["rel"], hit["signal"]):
+                rec = store.record(new_rel, existing_file["rel"], sim, hit)
+                found.append(rec)
+                if not quiet:
+                    print(f"  [{rec['signal']}] {new_rel} <-> {existing_file['rel']}")
+                    print(f"    A: {hit['snippet_a'][:100]}")
+                    print(f"    B: {hit['snippet_b'][:100]}")
+
+    return found
 
 
 # ---------------------------------------------------------------------------

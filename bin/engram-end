@@ -88,6 +88,7 @@ fi
 # Non-blocking contradiction check on new lossless content
 if [ -x "$SCRIPT_DIR/engram-contradict" ] || [ -f "$SCRIPT_DIR/engram-contradict" ]; then
   python3 "$SCRIPT_DIR/engram-contradict" --check-file "$LOSSLESS_FILE" --quiet 2>/dev/null &
+  disown 2>/dev/null || true
 fi
 
 ENGRAM_CONFIG="${ENGRAM_CONFIG:-$HOME/.config/engram/config.toml}"

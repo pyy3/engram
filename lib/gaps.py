@@ -21,6 +21,7 @@ from datetime import datetime
 
 
 GAPS_FILE = ".gaps.jsonl"
+GAPS_EMBEDDINGS_FILE = ".gaps-embeddings.json"
 MISS_SCORE_THRESHOLD = 0.30
 GAP_SIMILARITY_THRESHOLD = 0.75
 
@@ -60,6 +61,7 @@ class GapStore:
     def __init__(self, memory_root: Path):
         self.memory_root = memory_root
         self.gaps_path = memory_root / "semantic" / GAPS_FILE
+        self._emb_path = memory_root / "semantic" / GAPS_EMBEDDINGS_FILE
 
     def _load(self) -> list[dict]:
         """Load all gap records."""
@@ -82,24 +84,42 @@ class GapStore:
             f.write(json.dumps(record) + "\n")
 
     def _save_all(self, gaps: list[dict]):
-        """Rewrite all gap records."""
+        """Rewrite all gap records (atomic via temp file)."""
         self.gaps_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.gaps_path, "w", encoding="utf-8") as f:
+        tmp = self.gaps_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             for gap in gaps:
                 f.write(json.dumps(gap) + "\n")
+        os.replace(str(tmp), str(self.gaps_path))
+
+    def _load_embeddings(self) -> dict:
+        """Load embedding sidecar {gap_id: vector}."""
+        if not self._emb_path.exists():
+            return {}
+        try:
+            return json.loads(self._emb_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_embedding(self, gap_id: str, embedding: list):
+        """Save an embedding to the sidecar file."""
+        embs = self._load_embeddings()
+        embs[gap_id] = embedding
+        self._emb_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._emb_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(embs, f)
+        os.replace(str(tmp), str(self._emb_path))
 
     def _next_id(self) -> str:
-        """Generate next gap ID."""
-        date = datetime.now().strftime("%Y%m%d")
-        gaps = self._load()
-        today_gaps = [g for g in gaps if g.get("id", "").startswith(f"g-{date}")]
-        seq = len(today_gaps) + 1
-        return f"g-{date}-{seq:03d}"
+        """Generate next gap ID (timestamp-based, no race conditions)."""
+        return f"g-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
 
     def record(self, query: str, best_score: float, embedding: list = None):
         """Record a new knowledge gap."""
+        gap_id = self._next_id()
         record = {
-            "id": self._next_id(),
+            "id": gap_id,
             "query": query,
             "timestamp": datetime.now().isoformat(),
             "best_score": round(best_score, 4),
@@ -107,9 +127,9 @@ class GapStore:
             "last_searched": datetime.now().isoformat(),
             "status": "open",
         }
-        if embedding:
-            record["embedding"] = embedding
         self._append(record)
+        if embedding:
+            self._save_embedding(gap_id, embedding)
         return record
 
     def find_match(self, query_embedding: list) -> dict | None:
@@ -117,10 +137,11 @@ class GapStore:
         if not query_embedding:
             return None
         gaps = self._load()
+        embs = self._load_embeddings()
         for gap in gaps:
             if gap.get("status") != "open":
                 continue
-            gap_emb = gap.get("embedding")
+            gap_emb = embs.get(gap.get("id")) or gap.get("embedding")
             if gap_emb:
                 sim = cosine_similarity(query_embedding, gap_emb)
                 if sim > GAP_SIMILARITY_THRESHOLD:
