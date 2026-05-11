@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""
+Engram Log — Record a usage event to the engram analytics database.
+
+Usage:
+  engram log <operation> <layer> <file_path> <bytes> [details]
+
+Operations: start, end, search, read, write
+Layers: lossless, semantic, procedural, active (or empty string for none)
+
+Auto-creates DB + table on first call.
+Auto-detects project from $PWD.
+"""
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Allow importing from lib/ next to bin/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from engram_db import open_db, VALID_OPERATIONS
+
+
+def log_event(operation, layer=None, file_path=None, byte_count=0, details=None, project=None):
+    """Log a single event. Can be called as library function or via CLI."""
+    if project is None:
+        project = os.environ.get("ENGRAM_PROJECT", os.getcwd())
+
+    ts = datetime.now(timezone.utc).isoformat()
+    tokens_est = byte_count // 4
+
+    with open_db() as conn:
+        conn.execute(
+            "INSERT INTO events (timestamp, project, operation, layer, file_path, bytes, tokens_est, details) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, project, operation, layer or None, file_path or None, byte_count, tokens_est, details or None),
+        )
+        conn.commit()
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) < 4:
+        print("Usage: engram log <operation> <layer> <file_path> <bytes> [details]")
+        print(f"  Valid operations: {', '.join(sorted(VALID_OPERATIONS))}")
+        print("  layer can be empty string '' for none")
+        sys.exit(1)
+
+    operation = args[0]
+    if operation not in VALID_OPERATIONS:
+        print(f"Error: unknown operation '{operation}'. Valid: {', '.join(sorted(VALID_OPERATIONS))}", file=sys.stderr)
+        sys.exit(1)
+
+    layer = args[1] if args[1] else None
+    file_path = args[2] if args[2] else None
+    try:
+        byte_count = int(args[3])
+    except ValueError:
+        byte_count = 0
+    details = " ".join(args[4:]) if len(args) > 4 else None
+
+    log_event(operation, layer, file_path, byte_count, details)
+
+
+if __name__ == "__main__":
+    main()

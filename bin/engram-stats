@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+Engram Stats — Usage analytics for the Engram memory system.
+
+Usage:
+  engram stats [--project PATH] [--days N] [--history] [--all] [--backfill]
+
+Flags:
+  --project PATH   Filter to one project (default: current dir)
+  --days N         Filter to last N days (default: all)
+  --history        Show recent events timeline
+  --all            Show global stats across all projects
+  --backfill       One-time import from existing lossless/semantic/procedural/active files
+
+Note: backfill scans up to 2 directory levels under ~/. For deeper projects,
+use: engram log write <layer> <path> <bytes> backfill
+"""
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# Allow importing from lib/ next to bin/
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from engram_db import open_db
+
+
+def format_tokens(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    elif n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def backfill():
+    """Scan existing memory files and insert historical events."""
+    with open_db() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM events WHERE details = 'backfill'")
+        if cur.fetchone()[0] > 0:
+            print("Already backfilled. Skipping.")
+            return
+
+        count = 0
+        home = Path.home()
+
+        # Scan 1-2 levels deep under ~/
+        for pattern in ["*/.claude/memory", "*/*/.claude/memory"]:
+            for claude_dir in home.glob(pattern):
+                project = str(claude_dir.parent.parent)
+                _backfill_project(conn, project, claude_dir)
+                count += 1
+
+        conn.commit()
+        print(f"Backfill complete. Scanned {count} project(s) (up to 2 levels deep under ~/).")
+        if count:
+            print("Tip: deeper projects can be added with: engram log write <layer> <path> <bytes> backfill")
+
+
+def _backfill_project(conn, project, memory_root):
+    """Backfill events for a single project's memory directory."""
+    for layer in ["lossless", "semantic", "procedural", "active"]:
+        layer_dir = memory_root / layer
+        if not layer_dir.is_dir():
+            continue
+
+        for md_file in layer_dir.rglob("*.md"):
+            try:
+                stat = md_file.stat()
+                mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                byte_count = stat.st_size
+                rel_path = str(md_file.relative_to(memory_root))
+                operation = "end" if layer == "lossless" else "write"
+
+                conn.execute(
+                    "INSERT INTO events (timestamp, project, operation, layer, file_path, bytes, tokens_est, details) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (mtime.isoformat(), project, operation, layer, rel_path, byte_count, byte_count // 4, "backfill"),
+                )
+            except Exception:
+                pass
+
+
+def show_stats(project=None, days=None, show_history=False, show_all=False):
+    with open_db() as conn:
+        # Build WHERE clause
+        conditions = []
+        params = []
+
+        if not show_all and project:
+            conditions.append("project = ?")
+            params.append(project)
+
+        if days:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            conditions.append("timestamp >= ?")
+            params.append(cutoff)
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        extra = "AND" if where else "WHERE"
+
+        # Header
+        if show_all:
+            print("Engram Memory Usage (All Projects)")
+        else:
+            proj_name = Path(project).name if project else "unknown"
+            print(f"Engram Memory Usage (Project: {proj_name})")
+        print("\u2550" * 48)
+        print()
+
+        # Total stats
+        cur = conn.execute(f"SELECT COUNT(*), SUM(tokens_est) FROM events {where}", params)
+        total_ops, total_tokens = cur.fetchone()
+        total_tokens = total_tokens or 0
+
+        cur = conn.execute(
+            f"SELECT SUM(tokens_est) FROM events {where} {extra} operation IN ('read', 'search', 'start')",
+            params,
+        )
+        tokens_read = cur.fetchone()[0] or 0
+
+        cur = conn.execute(
+            f"SELECT SUM(tokens_est) FROM events {where} {extra} operation IN ('write', 'end')",
+            params,
+        )
+        tokens_written = cur.fetchone()[0] or 0
+
+        cur = conn.execute(
+            f"SELECT COUNT(*) FROM events {where} {extra} operation = 'start'",
+            params,
+        )
+        sessions = cur.fetchone()[0]
+
+        cur = conn.execute(
+            f"SELECT COUNT(*) FROM events {where} {extra} operation = 'search'",
+            params,
+        )
+        searches = cur.fetchone()[0]
+
+        print(f"  Total operations:   {total_ops}")
+        print(f"  Tokens read:        ~{format_tokens(tokens_read)}")
+        print(f"  Tokens written:     ~{format_tokens(tokens_written)}")
+        print(f"  Sessions:           {sessions}")
+        print(f"  Search queries:     {searches}")
+        print()
+
+        # By Layer
+        print("By Layer")
+        print("\u2500" * 48)
+        print(f"  {'Layer':<12} {'Reads':>6} {'Writes':>7} {'Tokens':>8} {'Files':>6}")
+        print("\u2500" * 48)
+
+        for layer in ["lossless", "semantic", "active", "procedural"]:
+            layer_where = f"{where} {extra} layer = ?"
+            layer_params = params + [layer]
+
+            cur = conn.execute(
+                f"SELECT COUNT(*) FROM events {layer_where} AND operation IN ('read', 'search', 'start')",
+                layer_params,
+            )
+            reads = cur.fetchone()[0]
+
+            cur = conn.execute(
+                f"SELECT COUNT(*) FROM events {layer_where} AND operation IN ('write', 'end')",
+                layer_params,
+            )
+            writes = cur.fetchone()[0]
+
+            cur = conn.execute(f"SELECT SUM(tokens_est) FROM events {layer_where}", layer_params)
+            layer_tokens = cur.fetchone()[0] or 0
+
+            cur = conn.execute(f"SELECT COUNT(DISTINCT file_path) FROM events {layer_where}", layer_params)
+            files = cur.fetchone()[0]
+
+            if reads or writes:
+                print(f"  {layer:<12} {reads:>6} {writes:>7} {format_tokens(layer_tokens):>8} {files:>6}")
+
+        print("\u2500" * 48)
+        print()
+
+        # By Operation
+        print("By Operation")
+        print("\u2500" * 48)
+
+        for op, label in [("start", "sessions"), ("end", "checkpoints"), ("search", "queries"), ("read", "file reads"), ("write", "file writes")]:
+            op_where = f"{where} {extra} operation = ?"
+            op_params = params + [op]
+            cur = conn.execute(f"SELECT COUNT(*) FROM events {op_where}", op_params)
+            count = cur.fetchone()[0]
+            if count:
+                print(f"  {op + ':':<10} {count} {label}")
+
+        print("\u2500" * 48)
+
+        # History
+        if show_history:
+            print()
+            print("Recent Activity")
+            print("\u2500" * 48)
+
+            cur = conn.execute(
+                f"SELECT timestamp, operation, layer, file_path, tokens_est FROM events {where} ORDER BY timestamp DESC LIMIT 20",
+                params,
+            )
+            for row in cur.fetchall():
+                ts, op, layer, fpath, tokens = row
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    date_str = dt.strftime("%m-%d %H:%M")
+                except Exception:
+                    date_str = ts[:16]
+                layer_str = layer or ""
+                fpath_str = Path(fpath).name if fpath else ""
+                tok_str = format_tokens(tokens) if tokens else ""
+                print(f"  {date_str}  {op:<7} {layer_str:<12} {fpath_str:<30} {tok_str}")
+
+
+def main():
+    args = sys.argv[1:]
+    project = os.getcwd()
+    days = None
+    show_history = False
+    show_all = False
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--project":
+            i += 1
+            if i < len(args):
+                project = os.path.abspath(args[i])
+        elif args[i] == "--days":
+            i += 1
+            if i < len(args):
+                try:
+                    days = int(args[i])
+                except ValueError:
+                    print(f"Error: --days requires an integer, got '{args[i]}'", file=sys.stderr)
+                    sys.exit(1)
+        elif args[i] == "--history":
+            show_history = True
+        elif args[i] == "--all":
+            show_all = True
+        elif args[i] == "--backfill":
+            backfill()
+            return
+        i += 1
+
+    show_stats(project=project, days=days, show_history=show_history, show_all=show_all)
+
+
+if __name__ == "__main__":
+    main()
