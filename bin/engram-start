@@ -54,5 +54,41 @@ else
   echo "(No active tasks yet)" >> "$CONTEXT_FILE"
 fi
 
+# Surface unresolved contradictions
+CONTRADICTIONS_FILE=".claude/memory/semantic/.contradictions.jsonl"
+if [ -f "$CONTRADICTIONS_FILE" ]; then
+  UNRESOLVED=$(grep -c '"status": "unresolved"' "$CONTRADICTIONS_FILE" 2>/dev/null || echo 0)
+  if [ "$UNRESOLVED" -gt 0 ]; then
+    echo "" >> "$CONTEXT_FILE"
+    echo "=== Unresolved contradictions: $UNRESOLVED ===" >> "$CONTEXT_FILE"
+    echo "Run 'engram contradict --list' to review." >> "$CONTEXT_FILE"
+  fi
+fi
+
+# Surface top open knowledge gaps
+GAPS_FILE=".claude/memory/semantic/.gaps.jsonl"
+if [ -f "$GAPS_FILE" ]; then
+  OPEN_GAPS=$(grep -c '"status": "open"' "$GAPS_FILE" 2>/dev/null || echo 0)
+  if [ "$OPEN_GAPS" -gt 0 ]; then
+    echo "" >> "$CONTEXT_FILE"
+    echo "=== Open knowledge gaps: $OPEN_GAPS ===" >> "$CONTEXT_FILE"
+    # Show top 3 most-searched gaps
+    python3 -c "
+import json, sys
+gaps = []
+for line in open('$GAPS_FILE'):
+    try:
+        g = json.loads(line.strip())
+        if g.get('status') == 'open':
+            gaps.append(g)
+    except: pass
+gaps.sort(key=lambda g: g.get('times_searched', 1), reverse=True)
+for g in gaps[:3]:
+    print(f\"  - '{g['query']}' (searched {g.get('times_searched',1)}x)\")
+" >> "$CONTEXT_FILE" 2>/dev/null || true
+    echo "Run 'engram gaps' for full list." >> "$CONTEXT_FILE"
+  fi
+fi
+
 echo "Context loaded: $CONTEXT_FILE"
 echo "Memory layers ready. Start working!"

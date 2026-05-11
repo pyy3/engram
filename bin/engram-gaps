@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""
+Engram Gaps — knowledge gap tracking and management.
+
+Tracks search misses and frequently-searched-but-unfound topics to
+identify what knowledge is missing from your memory.
+
+Usage:
+  engram gaps                   # List open gaps
+  engram gaps --json            # JSON output
+  engram gaps --fill "query"    # Mark gap as filled
+  engram gaps --dismiss "query" # Dismiss false positive
+  engram gaps --stats           # Gap frequency stats
+"""
+
+import os
+import sys
+import json
+from pathlib import Path
+
+# Add lib/ to path
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
+
+from gaps import GapStore
+
+
+def main():
+    args = sys.argv[1:]
+
+    memory_root = Path(".claude/memory")
+    if not memory_root.is_dir():
+        print("Error: .claude/memory/ not found. Run 'engram init' first.", file=sys.stderr)
+        sys.exit(1)
+
+    store = GapStore(memory_root)
+
+    json_mode = "--json" in args
+    stats_mode = "--stats" in args
+    fill_query = None
+    dismiss_query = None
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--fill":
+            i += 1
+            if i < len(args):
+                fill_query = args[i]
+        elif args[i] == "--dismiss":
+            i += 1
+            if i < len(args):
+                dismiss_query = args[i]
+        i += 1
+
+    if fill_query:
+        store.fill(fill_query)
+        print(f"Marked as filled: '{fill_query}'")
+        return
+
+    if dismiss_query:
+        store.dismiss(dismiss_query)
+        print(f"Dismissed: '{dismiss_query}'")
+        return
+
+    if stats_mode:
+        s = store.stats()
+        if json_mode:
+            print(json.dumps(s, indent=2))
+        else:
+            print(f"Knowledge Gap Stats")
+            print(f"  Total gaps:  {s['total']}")
+            print(f"  Open:        {s['open']}")
+            print(f"  Filled:      {s['filled']}")
+            print(f"  Dismissed:   {s['dismissed']}")
+            if s["most_searched"]:
+                print(f"\n  Most searched (open):")
+                for item in s["most_searched"]:
+                    print(f"    '{item['query']}' ({item['times']}x)")
+        return
+
+    # Default: list open gaps
+    open_gaps = store.list_open()
+    if json_mode:
+        print(json.dumps(open_gaps, indent=2))
+        return
+
+    if not open_gaps:
+        print("No open knowledge gaps recorded.")
+        return
+
+    print(f"Open knowledge gaps ({len(open_gaps)}):\n")
+    for gap in open_gaps:
+        times = gap.get("times_searched", 1)
+        last = gap.get("last_searched", "unknown")[:10]
+        print(f"  {gap['id']}  '{gap['query']}'")
+        print(f"           searched {times}x, last: {last}, best_score: {gap.get('best_score', 0):.2f}")
+
+
+if __name__ == "__main__":
+    main()

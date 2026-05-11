@@ -54,6 +54,9 @@ Usage:
   engram diff [DATE1 DATE2] [--last N]     Show changes between checkpoints
   engram forget "topic" [--file PATH]      Mark knowledge as superseded
   engram compact [--older-than DAYS]       Merge old lossless into summaries
+  engram tag <file> [--confidence C] [--urgency U] [--domain D] [--tags T]
+  engram gaps [--fill Q] [--dismiss Q] [--stats] [--json]
+  engram contradict "topic" [--scan] [--list] [--resolve ID]
   engram stats [--project P] [--days N]    Usage analytics (SQLite)
   engram log <op> <layer> <path> <bytes>   Record a usage event
   engram status                            Show memory layer stats
@@ -193,6 +196,18 @@ case "${1:-}" in
   compact)
     shift
     exec python3 "$BIN_DIR/engram-compact" "$@"
+    ;;
+  tag)
+    shift
+    exec python3 "$BIN_DIR/engram-tag" "$@"
+    ;;
+  gaps)
+    shift
+    exec python3 "$BIN_DIR/engram-gaps" "$@"
+    ;;
+  contradict)
+    shift
+    exec python3 "$BIN_DIR/engram-contradict" "$@"
     ;;
   version|--version|-v)
     echo "engram $VERSION"

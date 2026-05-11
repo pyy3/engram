@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+Engram Contradict — detect contradictions across memory files.
+
+Finds conflicting statements in semantic/ and procedural/ layers using
+heuristic checks: negation detection, numeric mismatches, and opposition
+patterns.
+
+Usage:
+  engram contradict "topic"        # Check topic for conflicts
+  engram contradict --scan         # Full pairwise scan
+  engram contradict --list         # Show unresolved contradictions
+  engram contradict --resolve ID   # Mark resolved
+  engram contradict --check-file F # Check a file against existing memory (quiet mode)
+
+Algorithm:
+  1. Embed query/content → find top-N similar files (cosine > 0.6)
+  2. For each pair, run heuristic checks:
+     - Negation: same nouns near negation in one ("use JWT" vs "don't use JWT")
+     - Numeric mismatch: same key, different value ("timeout: 30" vs "timeout: 60")
+     - Opposition: paired verbs with shared context ("enable X" vs "disable X")
+  3. Store hits in .contradictions.jsonl
+"""
+
+import os
+import sys
+import re
+import json
+from pathlib import Path
+from datetime import datetime
+
+# Add lib/ to path
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
+
+CONTRADICTIONS_FILE = ".contradictions.jsonl"
+SIM_THRESHOLD = 0.6
+
+# Negation patterns
+NEGATION_WORDS = {"not", "don't", "dont", "doesn't", "doesnt", "never", "no",
+                  "shouldn't", "shouldnt", "won't", "wont", "cannot", "can't",
+                  "cant", "avoid", "disable", "remove", "without"}
+
+# Opposition verb pairs
+OPPOSITION_PAIRS = [
+    ("enable", "disable"), ("add", "remove"), ("start", "stop"),
+    ("create", "delete"), ("allow", "block"), ("allow", "deny"),
+    ("include", "exclude"), ("activate", "deactivate"),
+    ("use", "avoid"), ("require", "optional"),
+    ("true", "false"), ("yes", "no"),
+]
+
+
+def get_embedding(text: str) -> list:
+    """Get embedding via configured provider or direct Ollama."""
+    try:
+        from embeddings import get_provider
+        provider = get_provider()
+        return provider.embed(text[:2000])
+    except Exception:
+        pass
+    try:
+        import urllib.request
+        url = os.environ.get("ENGRAM_OLLAMA_URL", "http://127.0.0.1:11434") + "/api/embeddings"
+        model = os.environ.get("ENGRAM_MODEL", "nomic-embed-text")
+        data = json.dumps({"model": model, "prompt": text[:2000]}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read()).get("embedding", [])
+    except Exception:
+        return []
+
+
+def cosine_similarity(a: list, b: list) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
+    norm_b = (sum(x * x for x in b) ** 0.5) or 1.0
+    return dot / (norm_a * norm_b)
+
+
+# ---------------------------------------------------------------------------
+# Heuristic detectors
+# ---------------------------------------------------------------------------
+def _extract_sentences(text: str) -> list[str]:
+    """Split text into rough sentences."""
+    # Strip frontmatter
+    try:
+        from frontmatter import strip_frontmatter
+        text = strip_frontmatter(text)
+    except ImportError:
+        pass
+    # Split on period/newline, keep non-empty
+    parts = re.split(r'[.\n]', text)
+    return [p.strip() for p in parts if p.strip() and len(p.strip()) > 10]
+
+
+def _extract_nouns(sentence: str) -> set[str]:
+    """Extract likely nouns/keywords (simple heuristic: capitalized or long words)."""
+    words = re.findall(r'\b[A-Za-z][\w-]*\b', sentence)
+    return {w.lower() for w in words if len(w) > 2 and w.lower() not in NEGATION_WORDS}
+
+
+def detect_negation(text_a: str, text_b: str) -> list[dict]:
+    """Detect negation contradictions: same subject, opposite assertion."""
+    hits = []
+    sents_a = _extract_sentences(text_a)
+    sents_b = _extract_sentences(text_b)
+
+    for sa in sents_a:
+        nouns_a = _extract_nouns(sa)
+        has_neg_a = bool(NEGATION_WORDS & {w.lower() for w in sa.split()})
+
+        for sb in sents_b:
+            nouns_b = _extract_nouns(sb)
+            has_neg_b = bool(NEGATION_WORDS & {w.lower() for w in sb.split()})
+
+            # Need shared nouns and exactly one negated
+            shared = nouns_a & nouns_b
+            if len(shared) >= 2 and has_neg_a != has_neg_b:
+                hits.append({
+                    "signal": "negation",
+                    "snippet_a": sa[:200],
+                    "snippet_b": sb[:200],
+                    "shared_terms": sorted(shared)[:5],
+                })
+    return hits
+
+
+def detect_numeric_mismatch(text_a: str, text_b: str) -> list[dict]:
+    """Detect numeric contradictions: same key/label, different number."""
+    hits = []
+    # Pattern: word followed by number (with optional separator)
+    num_re = re.compile(r'(\b[\w-]+)\s*[:=]\s*(\d+(?:\.\d+)?)')
+
+    nums_a = {m.group(1).lower(): m.group(2) for m in num_re.finditer(text_a)}
+    nums_b = {m.group(1).lower(): m.group(2) for m in num_re.finditer(text_b)}
+
+    for key in set(nums_a.keys()) & set(nums_b.keys()):
+        if nums_a[key] != nums_b[key]:
+            hits.append({
+                "signal": "numeric_mismatch",
+                "snippet_a": f"{key}: {nums_a[key]}",
+                "snippet_b": f"{key}: {nums_b[key]}",
+                "shared_terms": [key],
+            })
+    return hits
+
+
+def detect_opposition(text_a: str, text_b: str) -> list[dict]:
+    """Detect opposition: paired verbs with shared context."""
+    hits = []
+    words_a = {w.lower() for w in re.findall(r'\b\w+\b', text_a)}
+    words_b = {w.lower() for w in re.findall(r'\b\w+\b', text_b)}
+
+    for verb_a, verb_b in OPPOSITION_PAIRS:
+        # Check if one text has verb_a and other has verb_b (or vice versa)
+        if (verb_a in words_a and verb_b in words_b) or (verb_b in words_a and verb_a in words_b):
+            # Need shared context words (at least 2 non-trivial)
+            shared = words_a & words_b
+            shared -= {"the", "a", "an", "is", "are", "was", "were", "to", "in", "on",
+                       "for", "of", "and", "or", "it", "that", "this", "with", verb_a, verb_b}
+            if len(shared) >= 2:
+                # Find the sentences containing the verbs
+                snippet_a = ""
+                for s in _extract_sentences(text_a):
+                    if verb_a in s.lower() or verb_b in s.lower():
+                        snippet_a = s[:200]
+                        break
+                snippet_b = ""
+                for s in _extract_sentences(text_b):
+                    if verb_a in s.lower() or verb_b in s.lower():
+                        snippet_b = s[:200]
+                        break
+                if snippet_a and snippet_b:
+                    hits.append({
+                        "signal": "opposition",
+                        "snippet_a": snippet_a,
+                        "snippet_b": snippet_b,
+                        "shared_terms": sorted(shared)[:5],
+                    })
+    return hits
+
+
+def check_pair(text_a: str, text_b: str) -> list[dict]:
+    """Run all heuristic checks on a text pair."""
+    hits = []
+    hits.extend(detect_negation(text_a, text_b))
+    hits.extend(detect_numeric_mismatch(text_a, text_b))
+    hits.extend(detect_opposition(text_a, text_b))
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# Contradiction store
+# ---------------------------------------------------------------------------
+class ContradictionStore:
+    def __init__(self, memory_root: Path):
+        self.memory_root = memory_root
+        self.store_path = memory_root / "semantic" / CONTRADICTIONS_FILE
+
+    def _load(self) -> list[dict]:
+        if not self.store_path.exists():
+            return []
+        records = []
+        for line in self.store_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return records
+
+    def _append(self, record: dict):
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _save_all(self, records: list[dict]):
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.store_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+        os.replace(str(tmp), str(self.store_path))
+
+    def _next_id(self) -> str:
+        return f"c-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+
+    def record(self, file_a: str, file_b: str, similarity: float, hit: dict) -> dict:
+        rec = {
+            "id": self._next_id(),
+            "timestamp": datetime.now().isoformat(),
+            "status": "unresolved",
+            "file_a": file_a,
+            "file_b": file_b,
+            "similarity": round(similarity, 4),
+            "snippet_a": hit["snippet_a"],
+            "snippet_b": hit["snippet_b"],
+            "signal": hit["signal"],
+            "resolved_at": None,
+        }
+        self._append(rec)
+        return rec
+
+    def resolve(self, contradiction_id: str):
+        records = self._load()
+        for rec in records:
+            if rec.get("id") == contradiction_id:
+                rec["status"] = "resolved"
+                rec["resolved_at"] = datetime.now().isoformat()
+        self._save_all(records)
+
+    def list_unresolved(self) -> list[dict]:
+        return [r for r in self._load() if r.get("status") == "unresolved"]
+
+    def unresolved_count(self) -> int:
+        return len(self.list_unresolved())
+
+    def is_duplicate(self, file_a: str, file_b: str, signal: str) -> bool:
+        """Check if this contradiction pair+signal is already recorded."""
+        for r in self._load():
+            if r.get("status") == "unresolved":
+                if ((r.get("file_a") == file_a and r.get("file_b") == file_b) or
+                    (r.get("file_a") == file_b and r.get("file_b") == file_a)):
+                    if r.get("signal") == signal:
+                        return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Scanning logic
+# ---------------------------------------------------------------------------
+def _collect_files(memory_root: Path) -> list[dict]:
+    """Collect markdown files from semantic/ and procedural/."""
+    files = []
+    for layer in ("semantic", "procedural"):
+        layer_dir = memory_root / layer
+        if layer_dir.is_dir():
+            for fp in sorted(layer_dir.rglob("*.md")):
+                if fp.name.startswith("."):
+                    continue
+                try:
+                    content = fp.read_text(encoding="utf-8", errors="ignore")
+                    rel = str(fp.relative_to(memory_root.parent))
+                    files.append({"path": fp, "rel": rel, "text": content})
+                except Exception:
+                    continue
+    return files
+
+
+def scan_topic(topic: str, memory_root: Path, quiet: bool = False) -> list[dict]:
+    """Check a topic for contradictions against existing memory."""
+    store = ContradictionStore(memory_root)
+    files = _collect_files(memory_root)
+    if not files:
+        return []
+
+    # Embed topic to find relevant files
+    topic_emb = get_embedding(topic)
+    relevant = []
+
+    if topic_emb:
+        for f in files:
+            f_emb = get_embedding(f["text"][:2000])
+            if f_emb:
+                sim = cosine_similarity(topic_emb, f_emb)
+                if sim > SIM_THRESHOLD:
+                    relevant.append((sim, f))
+        relevant.sort(key=lambda x: -x[0])
+        relevant = relevant[:10]
+    else:
+        # Keyword fallback: files containing topic words
+        topic_words = {w.lower() for w in topic.split() if len(w) > 2}
+        for f in files:
+            f_lower = f["text"].lower()
+            if any(w in f_lower for w in topic_words):
+                relevant.append((0.5, f))
+
+    # Pairwise check among relevant files
+    found = []
+    for i in range(len(relevant)):
+        for j in range(i + 1, len(relevant)):
+            sim_i, file_i = relevant[i]
+            sim_j, file_j = relevant[j]
+            pair_sim = (sim_i + sim_j) / 2
+
+            hits = check_pair(file_i["text"], file_j["text"])
+            for hit in hits:
+                if not store.is_duplicate(file_i["rel"], file_j["rel"], hit["signal"]):
+                    rec = store.record(file_i["rel"], file_j["rel"], pair_sim, hit)
+                    found.append(rec)
+                    if not quiet:
+                        print(f"  [{rec['signal']}] {file_i['rel']} <-> {file_j['rel']}")
+                        print(f"    A: {hit['snippet_a'][:100]}")
+                        print(f"    B: {hit['snippet_b'][:100]}")
+
+    return found
+
+
+def scan_all(memory_root: Path) -> list[dict]:
+    """Full pairwise scan of semantic/ and procedural/ files."""
+    store = ContradictionStore(memory_root)
+    files = _collect_files(memory_root)
+    if not files:
+        print("No files to scan.")
+        return []
+
+    n = len(files)
+    total_pairs = n * (n - 1) // 2
+    print(f"Scanning {n} files ({total_pairs} pairs) for contradictions...")
+    found = []
+    checked = 0
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            checked += 1
+            if checked % 50 == 0:
+                print(f"  Progress: {checked}/{total_pairs} pairs checked...", end="\r")
+            hits = check_pair(files[i]["text"], files[j]["text"])
+            for hit in hits:
+                if not store.is_duplicate(files[i]["rel"], files[j]["rel"], hit["signal"]):
+                    rec = store.record(files[i]["rel"], files[j]["rel"], 0.0, hit)
+                    found.append(rec)
+                    print(f"  [{rec['signal']}] {files[i]['rel']} <-> {files[j]['rel']}")
+                    print(f"    A: {hit['snippet_a'][:100]}")
+                    print(f"    B: {hit['snippet_b'][:100]}")
+
+    if total_pairs >= 50:
+        print(f"  Progress: {total_pairs}/{total_pairs} pairs checked.   ")
+
+    return found
+
+
+def check_file(file_path: str, memory_root: Path, quiet: bool = False) -> list[dict]:
+    """Check a specific file against existing memory files."""
+    fp = Path(file_path)
+    if not fp.exists():
+        return []
+    new_content = fp.read_text(encoding="utf-8", errors="ignore")
+    if not new_content.strip():
+        return []
+
+    store = ContradictionStore(memory_root)
+    files = _collect_files(memory_root)
+    if not files:
+        return []
+
+    # Find files relevant to the new content via embedding similarity
+    new_emb = get_embedding(new_content[:2000])
+    relevant = []
+
+    if new_emb:
+        for f in files:
+            # Skip the file itself
+            if f["path"].resolve() == fp.resolve():
+                continue
+            f_emb = get_embedding(f["text"][:2000])
+            if f_emb:
+                sim = cosine_similarity(new_emb, f_emb)
+                if sim > SIM_THRESHOLD:
+                    relevant.append((sim, f))
+        relevant.sort(key=lambda x: -x[0])
+        relevant = relevant[:10]
+    else:
+        # Keyword fallback
+        words = {w.lower() for w in new_content.split()[:100] if len(w) > 3}
+        for f in files:
+            if f["path"].resolve() == fp.resolve():
+                continue
+            f_lower = f["text"].lower()
+            if sum(1 for w in words if w in f_lower) >= 3:
+                relevant.append((0.5, f))
+
+    # Compare the new content against each relevant file
+    found = []
+    new_rel = str(fp)
+    for sim, existing_file in relevant:
+        hits = check_pair(new_content, existing_file["text"])
+        for hit in hits:
+            if not store.is_duplicate(new_rel, existing_file["rel"], hit["signal"]):
+                rec = store.record(new_rel, existing_file["rel"], sim, hit)
+                found.append(rec)
+                if not quiet:
+                    print(f"  [{rec['signal']}] {new_rel} <-> {existing_file['rel']}")
+                    print(f"    A: {hit['snippet_a'][:100]}")
+                    print(f"    B: {hit['snippet_b'][:100]}")
+
+    return found
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    args = sys.argv[1:]
+
+    memory_root = Path(".claude/memory")
+    if not memory_root.is_dir():
+        print("Error: .claude/memory/ not found. Run 'engram init' first.", file=sys.stderr)
+        sys.exit(1)
+
+    store = ContradictionStore(memory_root)
+
+    if "--list" in args:
+        unresolved = store.list_unresolved()
+        if not unresolved:
+            print("No unresolved contradictions.")
+            return
+        print(f"Unresolved contradictions ({len(unresolved)}):\n")
+        for rec in unresolved:
+            print(f"  {rec['id']}  [{rec['signal']}]")
+            print(f"    {rec['file_a']} <-> {rec['file_b']}")
+            print(f"    A: {rec['snippet_a'][:100]}")
+            print(f"    B: {rec['snippet_b'][:100]}")
+            print()
+        return
+
+    if "--resolve" in args:
+        idx = args.index("--resolve")
+        if idx + 1 < len(args):
+            cid = args[idx + 1]
+            store.resolve(cid)
+            print(f"Resolved: {cid}")
+        else:
+            print("Error: --resolve requires an ID", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    quiet = "--quiet" in args
+
+    if "--check-file" in args:
+        idx = args.index("--check-file")
+        if idx + 1 < len(args):
+            found = check_file(args[idx + 1], memory_root, quiet=quiet)
+            if found and not quiet:
+                print(f"\nFound {len(found)} new contradiction(s)")
+        return
+
+    if "--scan" in args:
+        found = scan_all(memory_root)
+        print(f"\nScan complete: {len(found)} new contradiction(s) found")
+        return
+
+    # Positional: topic query
+    topic = " ".join(a for a in args if not a.startswith("-"))
+    if not topic:
+        print(__doc__.strip())
+        return
+
+    print(f"Checking for contradictions about: '{topic}'\n")
+    found = scan_topic(topic, memory_root, quiet=quiet)
+    if not found:
+        print("No contradictions found.")
+    else:
+        print(f"\nFound {len(found)} contradiction(s)")
+
+
+if __name__ == "__main__":
+    main()

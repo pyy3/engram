@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+Engram Tag — add/update frontmatter metadata on memory files.
+
+Usage:
+  engram tag <file> --confidence high --urgency active
+  engram tag <file> --domain auth --tags jwt,oauth
+  engram tag <file> --show
+  engram tag <file> --remove confidence
+
+Frontmatter format:
+  ---
+  confidence: high        # high=1.3x, medium=1.0x, low=0.7x
+  urgency: active         # active=1.2x, normal=1.0x, archived=0.8x
+  domain: authentication  # free-text, filterable via --domain
+  tags: [jwt, oauth]      # searchable tags
+  ---
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# Add lib/ to path
+SCRIPT_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(SCRIPT_DIR.parent / "lib"))
+
+from frontmatter import parse_frontmatter, update_frontmatter, render_frontmatter, strip_frontmatter
+
+VALID_CONFIDENCE = ("high", "medium", "low")
+VALID_URGENCY = ("active", "normal", "archived")
+
+
+def show_frontmatter(file_path: Path):
+    """Display current frontmatter for a file."""
+    content = file_path.read_text(encoding="utf-8")
+    meta = parse_frontmatter(content)
+    if not meta:
+        print(f"{file_path}: (no frontmatter)")
+        return
+    print(f"{file_path}:")
+    for key, value in meta.items():
+        print(f"  {key}: {value}")
+
+
+def tag_file(file_path: Path, updates: dict, removes: list):
+    """Update frontmatter on a file."""
+    content = file_path.read_text(encoding="utf-8")
+
+    # Build updates dict, setting removes to None
+    all_updates = dict(updates)
+    for key in removes:
+        all_updates[key] = None
+
+    new_content = update_frontmatter(content, all_updates)
+    file_path.write_text(new_content, encoding="utf-8")
+
+    # Show result
+    meta = parse_frontmatter(new_content)
+    if meta:
+        print(f"Updated {file_path}:")
+        for key, value in meta.items():
+            print(f"  {key}: {value}")
+    else:
+        print(f"Cleared frontmatter from {file_path}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("--help", "-h"):
+        print(__doc__.strip())
+        return
+
+    file_path = None
+    show = False
+    updates = {}
+    removes = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--show":
+            show = True
+        elif arg == "--remove":
+            i += 1
+            if i < len(args):
+                removes.append(args[i])
+        elif arg == "--confidence":
+            i += 1
+            if i < len(args):
+                val = args[i].lower()
+                if val not in VALID_CONFIDENCE:
+                    print(f"Error: confidence must be one of {VALID_CONFIDENCE}", file=sys.stderr)
+                    sys.exit(1)
+                updates["confidence"] = val
+        elif arg == "--urgency":
+            i += 1
+            if i < len(args):
+                val = args[i].lower()
+                if val not in VALID_URGENCY:
+                    print(f"Error: urgency must be one of {VALID_URGENCY}", file=sys.stderr)
+                    sys.exit(1)
+                updates["urgency"] = val
+        elif arg == "--domain":
+            i += 1
+            if i < len(args):
+                updates["domain"] = args[i]
+        elif arg == "--tags":
+            i += 1
+            if i < len(args):
+                updates["tags"] = [t.strip() for t in args[i].split(",") if t.strip()]
+        elif not arg.startswith("-") and file_path is None:
+            file_path = Path(arg)
+        i += 1
+
+    if file_path is None:
+        print("Error: no file specified", file=sys.stderr)
+        sys.exit(1)
+
+    if not file_path.exists():
+        print(f"Error: {file_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    if show:
+        show_frontmatter(file_path)
+        return
+
+    if not updates and not removes:
+        # Default to --show if no updates
+        show_frontmatter(file_path)
+        return
+
+    tag_file(file_path, updates, removes)
+
+
+if __name__ == "__main__":
+    main()
