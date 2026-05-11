@@ -216,6 +216,14 @@ def index_memory(memory_root: Path, client: QdrantClient, collection: str, incre
                 layer = l
                 break
 
+        # Parse frontmatter for payload enrichment
+        file_frontmatter = {}
+        try:
+            from frontmatter import parse_frontmatter as _pfm
+            file_frontmatter = _pfm(content)
+        except ImportError:
+            pass
+
         # Chunk the file
         chunks = chunk_file(content, rel_path)
 
@@ -232,18 +240,27 @@ def index_memory(memory_root: Path, client: QdrantClient, collection: str, incre
                 continue
 
             point_id += 1
+            payload = {
+                "file": rel_path,
+                "heading": chunk["heading"],
+                "context": chunk["context"],
+                "text": chunk["text"],
+                "line": chunk["line"],
+                "layer": layer,
+                "content_hash": content_hash,
+            }
+            # Add frontmatter fields to payload for filtering
+            if file_frontmatter:
+                for fm_key in ("confidence", "urgency", "domain"):
+                    if fm_key in file_frontmatter:
+                        payload[fm_key] = file_frontmatter[fm_key]
+                if "tags" in file_frontmatter and isinstance(file_frontmatter["tags"], list):
+                    payload["tags"] = file_frontmatter["tags"]
+
             points.append({
                 "id": point_id,
                 "vector": embedding,
-                "payload": {
-                    "file": rel_path,
-                    "heading": chunk["heading"],
-                    "context": chunk["context"],
-                    "text": chunk["text"],
-                    "line": chunk["line"],
-                    "layer": layer,
-                    "content_hash": content_hash,
-                },
+                "payload": payload,
             })
 
             # Batch upsert every 50 points
