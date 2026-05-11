@@ -77,6 +77,12 @@ LAST_CHUNK=$(find "$LOSSLESS_DIR" -name "*.md" -type f 2>/dev/null | sort | tail
 
 echo "Lossless chunk written: $LOSSLESS_FILE"
 
+# Log usage event (non-blocking, best-effort)
+CHUNK_BYTES=$(wc -c < "$LOSSLESS_FILE" 2>/dev/null || echo 0)
+if [ -x "$SCRIPT_DIR/engram-log" ] || command -v engram-log >/dev/null 2>&1; then
+  python3 "$SCRIPT_DIR/engram-log" end lossless "$LOSSLESS_FILE" "$CHUNK_BYTES" "checkpoint" 2>/dev/null || true
+fi
+
 # Auto-index into Qdrant if configured and available (background, non-blocking)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 ENGRAM_CONFIG="${ENGRAM_CONFIG:-$HOME/.config/engram/config.toml}"
