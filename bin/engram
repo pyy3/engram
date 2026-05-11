@@ -54,6 +54,8 @@ Usage:
   engram diff [DATE1 DATE2] [--last N]     Show changes between checkpoints
   engram forget "topic" [--file PATH]      Mark knowledge as superseded
   engram compact [--older-than DAYS]       Merge old lossless into summaries
+  engram stats [--project P] [--days N]    Usage analytics (SQLite)
+  engram log <op> <layer> <path> <bytes>   Record a usage event
   engram status                            Show memory layer stats
   engram version                           Print version
 
@@ -64,6 +66,8 @@ Options:
   --dry-run            Preview sync without making changes
   --all                Sync all layers (including lossless/active)
   --incremental        Only index new/changed files
+  --history            Show recent events timeline (stats)
+  --backfill           Import existing memory files into analytics DB (stats)
 
 Environment:
   ENGRAM_HOME          Installation directory (default: ~/.engram)
@@ -133,6 +137,14 @@ case "${1:-}" in
   qdrant)
     shift
     exec "$BIN_DIR/engram-qdrant" "$@"
+    ;;
+  stats)
+    shift
+    exec python3 "$BIN_DIR/engram-stats" "$@"
+    ;;
+  log)
+    shift
+    exec python3 "$BIN_DIR/engram-log" "$@"
     ;;
   status)
     shift
