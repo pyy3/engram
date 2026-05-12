@@ -1,0 +1,16 @@
+#!/bin/bash
+# Engram Cloud — Remove stored credentials.
+#
+# Usage: engram logout
+
+set -euo pipefail
+
+CRED_FILE="$HOME/.config/engram/credentials.json"
+
+if [ ! -f "$CRED_FILE" ]; then
+  echo "Not logged in (no credentials found)."
+  exit 0
+fi
+
+rm -f "$CRED_FILE"
+echo "Logged out. Credentials removed."

@@ -73,10 +73,10 @@ if [ -f "$GAPS_FILE" ]; then
     echo "" >> "$CONTEXT_FILE"
     echo "=== Open knowledge gaps: $OPEN_GAPS ===" >> "$CONTEXT_FILE"
     # Show top 3 most-searched gaps
-    python3 -c "
-import json, sys
+    GAPS_FILE="$GAPS_FILE" python3 -c "
+import json, sys, os
 gaps = []
-for line in open('$GAPS_FILE'):
+for line in open(os.environ['GAPS_FILE']):
     try:
         g = json.loads(line.strip())
         if g.get('status') == 'open':
@@ -90,5 +90,49 @@ for g in gaps[:3]:
   fi
 fi
 
+# Usage analytics
+echo ""
+echo "=== Memory Stats ==="
+
+# Local stats
+LOCAL_FILES=$(find .claude/memory -name "*.md" -type f 2>/dev/null | wc -l)
+LOCAL_SIZE=$(du -sh .claude/memory 2>/dev/null | cut -f1)
+LOSSLESS_COUNT=$(find .claude/memory/lossless -name "*.md" -type f 2>/dev/null | wc -l)
+SEMANTIC_COUNT=$(find .claude/memory/semantic -name "*.md" -type f 2>/dev/null | wc -l)
+PROCEDURAL_COUNT=$(find .claude/memory/procedural -name "*.md" -type f 2>/dev/null | wc -l)
+echo "  Local:  ${LOCAL_FILES} files (${LOCAL_SIZE}) — ${SEMANTIC_COUNT} semantic, ${PROCEDURAL_COUNT} procedural, ${LOSSLESS_COUNT} lossless"
+
+# Cloud stats (non-blocking, skip if not linked)
+CLOUD_CONFIG=".claude/memory/.engram-cloud.json"
+CREDS_FILE="$HOME/.config/engram/credentials.json"
+if [ -f "$CLOUD_CONFIG" ] && [ -f "$CREDS_FILE" ]; then
+  SERVER=$(python3 -c "import json,sys; print(json.load(sys.stdin)['server'])" < "$CREDS_FILE" 2>/dev/null)
+  API_KEY=$(python3 -c "import json,sys; print(json.load(sys.stdin)['api_key'])" < "$CREDS_FILE" 2>/dev/null)
+  STORE_ID=$(python3 -c "import json,sys; print(json.load(sys.stdin)['store_id'])" < "$CLOUD_CONFIG" 2>/dev/null)
+  STORE_NAME=$(python3 -c "import json,sys; print(json.load(sys.stdin)['store_name'])" < "$CLOUD_CONFIG" 2>/dev/null)
+  if [ -n "$SERVER" ] && [ -n "$API_KEY" ]; then
+    USAGE=$(curl -sf --connect-timeout 2 --max-time 5 \
+      "$SERVER/api/v1/billing/usage" \
+      -H "Authorization: Bearer $API_KEY" 2>/dev/null)
+    if [ -n "$USAGE" ]; then
+      echo "$USAGE" | python3 -c "
+import json, sys
+u = json.load(sys.stdin)
+plan = u['plan']
+usage = u['usage']
+limits = u['limits']
+storage_mb = usage['storage_bytes'] / (1024*1024)
+max_mb = limits['max_storage_bytes'] / (1024*1024)
+print(f'  Cloud:  {plan} plan — {usage[\"searches\"]}/{limits[\"max_searches_per_month\"]} searches, {storage_mb:.1f}/{max_mb:.0f} MB, {usage[\"syncs\"]} syncs')
+" 2>/dev/null || echo "  Cloud:  connected (stats unavailable)"
+    else
+      echo "  Cloud:  offline"
+    fi
+  fi
+else
+  echo "  Cloud:  not linked (run 'engram login && engram link')"
+fi
+
+echo ""
 echo "Context loaded: $CONTEXT_FILE"
 echo "Memory layers ready. Start working!"

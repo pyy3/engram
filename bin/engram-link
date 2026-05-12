@@ -1,0 +1,172 @@
+#!/bin/bash
+# Engram Cloud — Link a project to a cloud memory store.
+#
+# Usage:
+#   engram link --store <name>           Link to existing or create new store
+#   engram link --store-id <uuid>        Link to store by ID
+#   engram link --unlink                 Remove cloud link
+#
+# Writes .claude/memory/.engram-cloud.json in the current project.
+
+set -euo pipefail
+
+CRED_FILE="$HOME/.config/engram/credentials.json"
+MEMORY_ROOT=".claude/memory"
+LINK_FILE="$MEMORY_ROOT/.engram-cloud.json"
+
+# --- helpers ---------------------------------------------------------------
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+# Build JSON safely via python3
+make_json() {
+  python3 -c "
+import json, sys
+d = {}
+args = sys.argv[1:]
+i = 0
+while i < len(args) - 1:
+    d[args[i]] = args[i+1]
+    i += 2
+print(json.dumps(d, indent=2))
+" "$@"
+}
+
+load_creds() {
+  [ -f "$CRED_FILE" ] || die "Not logged in. Run 'engram login' first."
+  API_KEY=$(python3 -c "import json,sys; print(json.load(sys.stdin)['api_key'])" < "$CRED_FILE")
+  SERVER=$(python3 -c "import json,sys; print(json.load(sys.stdin)['server'])" < "$CRED_FILE")
+  DEVICE_ID=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('device_id',''))" < "$CRED_FILE")
+}
+
+api_get() {
+  curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
+    -H "Authorization: Bearer $API_KEY" \
+    "$1" 2>/dev/null
+}
+
+api_post() {
+  echo "$2" | curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
+    -X POST \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    --data-binary @- \
+    "$1" 2>/dev/null
+}
+
+# --- arg parsing -----------------------------------------------------------
+
+STORE_NAME=""
+STORE_ID=""
+UNLINK=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --store)     STORE_NAME="${2:?--store requires a name}"; shift 2 ;;
+    --store=*)   STORE_NAME="${1#*=}"; shift ;;
+    --store-id)  STORE_ID="${2:?--store-id requires a UUID}"; shift 2 ;;
+    --store-id=*) STORE_ID="${1#*=}"; shift ;;
+    --unlink)    UNLINK=true; shift ;;
+    --*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      if [[ -z "$STORE_NAME" ]]; then
+        STORE_NAME="$1"
+      else
+        die "Unexpected argument: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# --- unlink ----------------------------------------------------------------
+
+if $UNLINK; then
+  if [ -f "$LINK_FILE" ]; then
+    rm -f "$LINK_FILE"
+    echo "Cloud link removed."
+  else
+    echo "No cloud link found."
+  fi
+  exit 0
+fi
+
+# --- validate --------------------------------------------------------------
+
+[ -d "$MEMORY_ROOT" ] || die "Engram not initialized. Run 'engram init' first."
+[[ -n "$STORE_NAME" || -n "$STORE_ID" ]] || die "Usage: engram link --store <name>"
+load_creds
+
+# --- find or create store --------------------------------------------------
+
+if [[ -n "$STORE_ID" ]]; then
+  echo "Linking to store $STORE_ID..."
+  RESP=$(api_get "$SERVER/api/v1/stores")
+  HTTP_CODE=$(echo "$RESP" | tail -1)
+  BODY=$(echo "$RESP" | sed '$d')
+  [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]] || die "Failed to list stores ($HTTP_CODE)"
+
+  FOUND=$(echo "$BODY" | MATCH_FIELD=id MATCH_VAL="$STORE_ID" python3 -c "
+import json, sys, os
+stores = json.load(sys.stdin)
+val = os.environ['MATCH_VAL']
+for s in stores:
+    if s.get('id') == val:
+        print(json.dumps(s))
+        sys.exit(0)
+sys.exit(1)
+") || die "Store $STORE_ID not found"
+
+  STORE_NAME=$(echo "$FOUND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('name',''))")
+else
+  echo "Looking for store '$STORE_NAME'..."
+
+  RESP=$(api_get "$SERVER/api/v1/stores")
+  HTTP_CODE=$(echo "$RESP" | tail -1)
+  BODY=$(echo "$RESP" | sed '$d')
+  [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]] || die "Failed to list stores ($HTTP_CODE)"
+
+  FOUND=$(echo "$BODY" | MATCH_FIELD=name MATCH_VAL="$STORE_NAME" python3 -c "
+import json, sys, os
+stores = json.load(sys.stdin)
+val = os.environ['MATCH_VAL']
+for s in stores:
+    if s.get('name') == val or s.get('slug') == val:
+        print(json.dumps(s))
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null) || FOUND=""
+
+  if [[ -n "$FOUND" ]]; then
+    STORE_ID=$(echo "$FOUND" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+    echo "Found existing store: $STORE_NAME ($STORE_ID)"
+  else
+    echo "Creating store '$STORE_NAME'..."
+    CREATE_BODY=$(make_json "name" "$STORE_NAME")
+    RESP=$(api_post "$SERVER/api/v1/stores" "$CREATE_BODY")
+    HTTP_CODE=$(echo "$RESP" | tail -1)
+    BODY=$(echo "$RESP" | sed '$d')
+    [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]] || die "Failed to create store ($HTTP_CODE): $BODY"
+    STORE_ID=$(echo "$BODY" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+    echo "Created store: $STORE_NAME ($STORE_ID)"
+  fi
+fi
+
+# --- write link file (safe JSON via python3) --------------------------------
+
+make_json \
+  "store_id" "$STORE_ID" \
+  "store_name" "$STORE_NAME" \
+  "server" "$SERVER" \
+  "device_id" "$DEVICE_ID" \
+  "linked_at" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > "$LINK_FILE"
+
+echo ""
+echo "Project linked to cloud store: $STORE_NAME"
+echo "Link file: $LINK_FILE"
+echo ""
+echo "Next: engram push    Upload local memory"
+echo "      engram pull    Download cloud changes"

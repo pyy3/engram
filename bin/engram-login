@@ -1,0 +1,181 @@
+#!/bin/bash
+# Engram Cloud — Sign up, log in, or store an API key.
+#
+# Usage:
+#   engram login                          Interactive signup/login
+#   engram login --api-key KEY            Store an existing API key
+#   engram login --server URL             Use a custom server (default: https://api.engram.sh)
+#
+# Credentials are stored in ~/.config/engram/credentials.json
+
+set -euo pipefail
+
+CRED_DIR="$HOME/.config/engram"
+CRED_FILE="$CRED_DIR/credentials.json"
+DEFAULT_SERVER="https://api.engram.sh"
+
+# --- helpers ---------------------------------------------------------------
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+json_val() {
+  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get(sys.argv[1],''))" "$1" 2>/dev/null
+}
+
+# Build JSON safely via python3 (no shell interpolation into JSON)
+make_json() {
+  python3 -c "
+import json, sys
+d = {}
+args = sys.argv[1:]
+i = 0
+while i < len(args) - 1:
+    d[args[i]] = args[i+1]
+    i += 2
+print(json.dumps(d))
+" "$@"
+}
+
+get_device_id() {
+  # Stable device ID: reuse existing or generate once
+  if [ -f "$CRED_FILE" ]; then
+    local existing
+    existing=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('device_id',''))" < "$CRED_FILE" 2>/dev/null || true)
+    if [ -n "$existing" ]; then
+      echo "$existing"
+      return
+    fi
+  fi
+  # Generate a stable ID from hostname + a random suffix (persisted on first save)
+  python3 -c "import uuid,socket; print(f'{socket.gethostname()}-{uuid.uuid4().hex[:8]}')"
+}
+
+save_credentials() {
+  local api_key="$1" server="$2"
+  local device_id
+  device_id=$(get_device_id)
+  mkdir -p "$CRED_DIR"
+  chmod 700 "$CRED_DIR"
+  (umask 077 && make_json "api_key" "$api_key" "server" "$server" "device_id" "$device_id" > "$CRED_FILE")
+  echo "Credentials saved to $CRED_FILE"
+}
+
+api_post() {
+  local url="$1" body="$2"
+  echo "$body" | curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
+    -X POST "$url" \
+    -H "Content-Type: application/json" \
+    --data-binary @- 2>/dev/null
+}
+
+# --- arg parsing -----------------------------------------------------------
+
+API_KEY=""
+SERVER="$DEFAULT_SERVER"
+ACTION=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --api-key)  API_KEY="${2:?--api-key requires a value}"; shift 2 ;;
+    --api-key=*) API_KEY="${1#*=}"; shift ;;
+    --server)   SERVER="${2:?--server requires a value}"; shift 2 ;;
+    --server=*) SERVER="${1#*=}"; shift ;;
+    signup|register) ACTION="signup"; shift ;;
+    *)
+      echo "Warning: unknown argument '$1' ignored" >&2
+      shift
+      ;;
+  esac
+done
+
+# Remove trailing slash from server
+SERVER="${SERVER%/}"
+
+# --- direct API key mode ---------------------------------------------------
+
+if [[ -n "$API_KEY" ]]; then
+  if [[ ! "$API_KEY" == engram_* ]]; then
+    die "API key must start with 'engram_'"
+  fi
+  save_credentials "$API_KEY" "$SERVER"
+  echo "Logged in with API key."
+  exit 0
+fi
+
+# --- interactive mode ------------------------------------------------------
+
+echo "Engram Cloud"
+echo "============"
+echo ""
+
+if [[ "$ACTION" != "signup" ]]; then
+  echo "1) Sign up (new account)"
+  echo "2) Log in (existing account)"
+  echo ""
+  printf "Choice [1/2]: "
+  read -r choice
+  case "$choice" in
+    1|signup) ACTION="signup" ;;
+    2|login)  ACTION="login" ;;
+    *)        ACTION="signup" ;;
+  esac
+  echo ""
+fi
+
+# Read email
+printf "Email: "
+read -r email
+[[ -z "$email" ]] && die "Email is required"
+[[ "$email" != *@* ]] && die "Invalid email"
+
+# Read password (hidden)
+printf "Password: "
+read -rs password
+echo ""
+[[ -z "$password" ]] && die "Password is required"
+
+if [[ "$ACTION" == "signup" ]]; then
+  # Confirm password for signup
+  printf "Confirm password: "
+  read -rs password2
+  echo ""
+  [[ "$password" != "$password2" ]] && die "Passwords do not match"
+  [[ ${#password} -lt 8 ]] && die "Password must be at least 8 characters"
+
+  echo ""
+  echo "Creating account..."
+  BODY=$(make_json "email" "$email" "password" "$password")
+  RESP=$(api_post "$SERVER/api/v1/auth/register" "$BODY")
+else
+  echo ""
+  echo "Logging in..."
+  BODY=$(make_json "email" "$email" "password" "$password")
+  RESP=$(api_post "$SERVER/api/v1/auth/login" "$BODY")
+fi
+
+# Split response body and HTTP status code
+HTTP_CODE=$(echo "$RESP" | tail -1)
+BODY_TEXT=$(echo "$RESP" | sed '$d')
+
+if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
+  KEY=$(echo "$BODY_TEXT" | json_val "api_key")
+  if [[ -z "$KEY" ]]; then
+    die "Server returned success but no API key in response"
+  fi
+  save_credentials "$KEY" "$SERVER"
+  echo ""
+  echo "Success! You are now logged in."
+  PREFIX="${KEY:0:12}"
+  echo "API key: ${PREFIX}..."
+  echo ""
+  echo "Next steps:"
+  echo "  engram link --store <name>    Link a project to cloud storage"
+  echo "  engram push                   Push local memory to cloud"
+elif [[ "$HTTP_CODE" == "409" ]]; then
+  die "Email already registered. Use 'engram login' to sign in."
+elif [[ "$HTTP_CODE" == "401" ]]; then
+  die "Invalid email or password."
+else
+  ERROR=$(echo "$BODY_TEXT" | json_val "error")
+  die "Server error ($HTTP_CODE): ${ERROR:-$BODY_TEXT}"
+fi
