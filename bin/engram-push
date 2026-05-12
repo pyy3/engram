@@ -62,9 +62,12 @@ def save_push_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
 
 
+MAX_FILE_SIZE = 1024 * 1024  # 1 MB per file
+
 def scan_local_files(layers: list) -> list:
     """Scan local memory layers and return list of (layer, path, content, hash)."""
     files = []
+    memory_resolved = str(MEMORY_ROOT.resolve()) + os.sep
     for layer in layers:
         layer_dir = MEMORY_ROOT / layer
         if not layer_dir.is_dir():
@@ -77,10 +80,18 @@ def scan_local_files(layers: list) -> list:
             # Skip hidden files except known ones
             if fpath.name.startswith(".") and not fpath.name.endswith(".jsonl"):
                 continue
+            # Reject symlinks that escape the memory root
+            resolved = str(fpath.resolve())
+            if not resolved.startswith(memory_resolved):
+                continue
             rel = str(fpath.relative_to(MEMORY_ROOT / layer))
             try:
                 content = fpath.read_text(errors="replace")
             except Exception:
+                continue
+            # Skip files that are too large
+            if len(content) > MAX_FILE_SIZE:
+                print(f"  Skipping {layer}/{rel} ({len(content)} bytes > {MAX_FILE_SIZE} limit)", file=sys.stderr)
                 continue
             h = file_hash(content)
             files.append((layer, rel, content, h))
@@ -151,6 +162,11 @@ def main():
         die("Engram not initialized. Run 'engram init' first.")
 
     config = load_config()
+
+    # Validate layer argument (#2)
+    if layer_filter and layer_filter not in SYNC_LAYERS:
+        die(f"Invalid layer '{layer_filter}'. Valid: {', '.join(sorted(SYNC_LAYERS))}")
+
     layers = [layer_filter] if layer_filter else SYNC_LAYERS
 
     # Load previous push state
