@@ -79,7 +79,8 @@ if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
   echo "  Remote v: $REMOTE_VERSION"
   echo ""
 
-  if [[ "$BEHIND" -gt 0 ]]; then
+  BEHIND="${BEHIND:-0}"
+  if [[ "$BEHIND" =~ ^[0-9]+$ ]] && [[ "$BEHIND" -gt 0 ]]; then
     echo "  Status: $BEHIND version(s) behind — run 'engram pull'"
   elif [[ "$LOCAL_VERSION" -eq "$REMOTE_VERSION" ]]; then
     echo "  Status: up to date"

@@ -187,7 +187,7 @@ def main():
         layer = change.get("layer", "")
         path = change.get("path", "")
         h = change.get("content_hash", "")
-        if layer and path:
+        if layer and path and validate_path(layer, path):
             key = f"{layer}/{path}"
             if change.get("operation") == "delete":
                 hashes.pop(key, None)

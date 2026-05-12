@@ -196,20 +196,20 @@ def main():
     total_applied = 0
     new_version = base_version
 
+    new_hashes = dict(prev_hashes)
+
     for i in range(0, len(changes), BATCH_SIZE):
         batch = changes[i:i + BATCH_SIZE]
         result = push_changes(config, batch, new_version)
         applied = result.get("applied", [])
         total_applied += len(applied)
         new_version = result.get("version", new_version)
+        # Checkpoint after each batch so partial pushes are resumable
+        for c in batch:
+            new_hashes[f"{c['layer']}/{c['path']}"] = c["content_hash"]
+        save_push_state({"hashes": new_hashes, "version": new_version})
         if len(changes) > BATCH_SIZE:
             print(f"  Pushed batch {i // BATCH_SIZE + 1}: {len(applied)} files")
-
-    # Update push state with new hashes
-    new_hashes = dict(prev_hashes)
-    for layer, path, content, h in local_files:
-        new_hashes[f"{layer}/{path}"] = h
-    save_push_state({"hashes": new_hashes, "version": new_version})
 
     print(f"\nPushed {total_applied} files. Server version: {new_version}")
 

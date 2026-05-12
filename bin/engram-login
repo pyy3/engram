@@ -19,7 +19,7 @@ DEFAULT_SERVER="https://api.engram.sh"
 die() { echo "Error: $*" >&2; exit 1; }
 
 json_val() {
-  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$1',''))" 2>/dev/null
+  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get(sys.argv[1],''))" "$1" 2>/dev/null
 }
 
 # Build JSON safely via python3 (no shell interpolation into JSON)
@@ -40,7 +40,7 @@ get_device_id() {
   # Stable device ID: reuse existing or generate once
   if [ -f "$CRED_FILE" ]; then
     local existing
-    existing=$(python3 -c "import json; print(json.load(open('$CRED_FILE')).get('device_id',''))" 2>/dev/null || true)
+    existing=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('device_id',''))" < "$CRED_FILE" 2>/dev/null || true)
     if [ -n "$existing" ]; then
       echo "$existing"
       return
@@ -56,8 +56,7 @@ save_credentials() {
   device_id=$(get_device_id)
   mkdir -p "$CRED_DIR"
   chmod 700 "$CRED_DIR"
-  make_json "api_key" "$api_key" "server" "$server" "device_id" "$device_id" > "$CRED_FILE"
-  chmod 600 "$CRED_FILE"
+  (umask 077 && make_json "api_key" "$api_key" "server" "$server" "device_id" "$device_id" > "$CRED_FILE")
   echo "Credentials saved to $CRED_FILE"
 }
 
