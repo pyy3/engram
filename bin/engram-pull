@@ -18,7 +18,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-MEMORY_ROOT = Path(".claude/memory")
+MEMORY_ROOT = Path(".claude/memory").resolve()
 LINK_FILE = MEMORY_ROOT / ".engram-cloud.json"
 CRED_FILE = Path.home() / ".config" / "engram" / "credentials.json"
 STATE_FILE = MEMORY_ROOT / ".engram-push-state.json"

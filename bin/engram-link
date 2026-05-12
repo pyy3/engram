@@ -67,9 +67,14 @@ while [[ $# -gt 0 ]]; do
     --store-id)  STORE_ID="${2:?--store-id requires a UUID}"; shift 2 ;;
     --store-id=*) STORE_ID="${1#*=}"; shift ;;
     --unlink)    UNLINK=true; shift ;;
+    --*)
+      die "Unknown option: $1"
+      ;;
     *)
-      if [[ -z "$STORE_NAME" && ! "$1" == --* ]]; then
+      if [[ -z "$STORE_NAME" ]]; then
         STORE_NAME="$1"
+      else
+        die "Unexpected argument: $1"
       fi
       shift
       ;;

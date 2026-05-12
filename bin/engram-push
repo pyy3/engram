@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-MEMORY_ROOT = Path(".claude/memory")
+MEMORY_ROOT = Path(".claude/memory").resolve()
 LINK_FILE = MEMORY_ROOT / ".engram-cloud.json"
 CRED_FILE = Path.home() / ".config" / "engram" / "credentials.json"
 SYNC_LAYERS = ["semantic", "procedural", "lossless", "active"]
@@ -220,9 +220,11 @@ def main():
         applied = result.get("applied", [])
         total_applied += len(applied)
         new_version = result.get("version", new_version)
-        # Checkpoint after each batch so partial pushes are resumable
+        # Only update hashes for files the server actually applied
+        applied_keys = {(a.get("path"), a.get("op")) for a in applied}
         for c in batch:
-            new_hashes[f"{c['layer']}/{c['path']}"] = c["content_hash"]
+            if (c["path"], c["operation"]) in applied_keys:
+                new_hashes[f"{c['layer']}/{c['path']}"] = c["content_hash"]
         save_push_state({"hashes": new_hashes, "version": new_version})
         if len(changes) > BATCH_SIZE:
             print(f"  Pushed batch {i // BATCH_SIZE + 1}: {len(applied)} files")

@@ -55,6 +55,14 @@ if [ -f "$STATE_FILE" ]; then
   LOCAL_VERSION="${LOCAL_VERSION:-0}"
 fi
 
+# Validate IDs to prevent URL injection
+if [[ ! "$STORE_ID" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  die "invalid store_id in link file"
+fi
+if [[ ! "$DEVICE_ID" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+  DEVICE_ID="default"
+fi
+
 # --- fetch server status ---------------------------------------------------
 
 echo "Engram Cloud Status"
@@ -72,7 +80,7 @@ RESP=$(curl -s --connect-timeout 10 --max-time 15 -w "\n%{http_code}" \
 HTTP_CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
 
-if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
+if [[ "$HTTP_CODE" =~ ^[0-9]+$ ]] && [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
   REMOTE_VALUES=$(echo "$BODY" | read_json_fields latest_version behind)
   REMOTE_VERSION=$(echo "$REMOTE_VALUES" | head -1)
   REMOTE_VERSION="${REMOTE_VERSION:-0}"
@@ -84,7 +92,7 @@ if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
   BEHIND="${BEHIND:-0}"
   if [[ "$BEHIND" =~ ^[0-9]+$ ]] && [[ "$BEHIND" -gt 0 ]]; then
     echo "  Status: $BEHIND version(s) behind — run 'engram pull'"
-  elif [[ "$LOCAL_VERSION" -eq "$REMOTE_VERSION" ]]; then
+  elif [[ "$LOCAL_VERSION" =~ ^[0-9]+$ ]] && [[ "$LOCAL_VERSION" -eq "$REMOTE_VERSION" ]]; then
     echo "  Status: up to date"
   else
     echo "  Status: synced (remote v$REMOTE_VERSION)"

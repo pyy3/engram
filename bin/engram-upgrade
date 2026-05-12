@@ -20,8 +20,8 @@ json_val() {
 
 # Load credentials
 [ -f "$CRED_FILE" ] || die "Not logged in. Run 'engram login' first."
-SERVER=$(python3 -c "import json; print(json.load(open('$CRED_FILE'))['server'])" 2>/dev/null)
-API_KEY=$(python3 -c "import json; print(json.load(open('$CRED_FILE'))['api_key'])" 2>/dev/null)
+SERVER=$(python3 -c "import json,sys; print(json.load(sys.stdin)['server'])" < "$CRED_FILE" 2>/dev/null)
+API_KEY=$(python3 -c "import json,sys; print(json.load(sys.stdin)['api_key'])" < "$CRED_FILE" 2>/dev/null)
 [ -n "$SERVER" ] && [ -n "$API_KEY" ] || die "Invalid credentials. Run 'engram login' again."
 
 api_get() {
