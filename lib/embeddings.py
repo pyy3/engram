@@ -165,6 +165,16 @@ class EmbeddingError(Exception):
     pass
 
 
+def cosine_similarity(a: list, b: list) -> float:
+    """Compute cosine similarity between two vectors."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = (sum(x * x for x in a) ** 0.5) or 1.0
+    norm_b = (sum(x * x for x in b) ** 0.5) or 1.0
+    return dot / (norm_a * norm_b)
+
+
 # Provider registry
 PROVIDERS = {
     "ollama": OllamaProvider,

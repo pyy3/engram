@@ -85,6 +85,18 @@ fi
 
 # Auto-index into Qdrant if configured and available (background, non-blocking)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# Log usage event (non-blocking, best-effort)
+CHUNK_BYTES=$(wc -c < "$LOSSLESS_FILE" 2>/dev/null || echo 0)
+if [ -x "$SCRIPT_DIR/engram-log" ] || command -v engram-log >/dev/null 2>&1; then
+  python3 "$SCRIPT_DIR/engram-log" end lossless "$LOSSLESS_FILE" "$CHUNK_BYTES" "checkpoint" 2>/dev/null || true
+fi
+# Non-blocking contradiction check on new lossless content
+if [ -x "$SCRIPT_DIR/engram-contradict" ] || [ -f "$SCRIPT_DIR/engram-contradict" ]; then
+  python3 "$SCRIPT_DIR/engram-contradict" --check-file "$LOSSLESS_FILE" --quiet 2>/dev/null &
+  disown 2>/dev/null || true
+fi
+
 ENGRAM_CONFIG="${ENGRAM_CONFIG:-$HOME/.config/engram/config.toml}"
 
 # Check if vector_db auto_index is enabled (default: index if Qdrant is running)
