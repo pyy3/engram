@@ -46,28 +46,12 @@ api_get() {
 }
 
 api_post() {
-  curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
+  echo "$2" | curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
     -X POST \
     -H "Authorization: Bearer $API_KEY" \
     -H "Content-Type: application/json" \
-    -d "$2" \
+    --data-binary @- \
     "$1" 2>/dev/null
-}
-
-# Find a store by name/slug or ID in a JSON array (via stdin)
-find_store() {
-  local match_field="$1" match_value="$2"
-  python3 -c "
-import json, sys, os
-stores = json.load(sys.stdin)
-val = os.environ['MATCH_VAL']
-field = os.environ['MATCH_FIELD']
-for s in stores:
-    if s.get(field) == val or (field == 'name' and s.get('slug') == val):
-        print(json.dumps(s))
-        sys.exit(0)
-sys.exit(1)
-" <<< "" 2>/dev/null  # placeholder — actual input piped below
 }
 
 # --- arg parsing -----------------------------------------------------------

@@ -62,10 +62,10 @@ save_credentials() {
 
 api_post() {
   local url="$1" body="$2"
-  curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
+  echo "$body" | curl -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" \
     -X POST "$url" \
     -H "Content-Type: application/json" \
-    -d "$body" 2>/dev/null
+    --data-binary @- 2>/dev/null
 }
 
 # --- arg parsing -----------------------------------------------------------

@@ -65,7 +65,7 @@ def validate_path(layer: str, path: str) -> bool:
     # Resolve and ensure it stays within MEMORY_ROOT
     resolved = (MEMORY_ROOT / layer / path).resolve()
     memory_resolved = MEMORY_ROOT.resolve()
-    if not str(resolved).startswith(str(memory_resolved)):
+    if not str(resolved).startswith(str(memory_resolved) + os.sep):
         return False
     return True
 

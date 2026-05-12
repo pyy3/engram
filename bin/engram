@@ -238,8 +238,8 @@ case "${1:-}" in
   cloud)
     shift
     case "${1:-}" in
-      status) shift; exec "$BIN_DIR/engram-cloud-status" "$@" ;;
-      *)      exec "$BIN_DIR/engram-cloud-status" "$@" ;;
+      status|"") shift; exec "$BIN_DIR/engram-cloud-status" "$@" ;;
+      *)      echo "Unknown cloud command: $1" >&2; echo "Usage: engram cloud status" >&2; exit 1 ;;
     esac
     ;;
   version|--version|-v)
