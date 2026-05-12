@@ -52,6 +52,7 @@ DEVICE_ID="${DEVICE_ID:-default}"
 LOCAL_VERSION=0
 if [ -f "$STATE_FILE" ]; then
   LOCAL_VERSION=$(read_json_fields version < "$STATE_FILE")
+  LOCAL_VERSION="${LOCAL_VERSION:-0}"
 fi
 
 # --- fetch server status ---------------------------------------------------
@@ -74,6 +75,7 @@ BODY=$(echo "$RESP" | sed '$d')
 if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
   REMOTE_VALUES=$(echo "$BODY" | read_json_fields latest_version behind)
   REMOTE_VERSION=$(echo "$REMOTE_VALUES" | head -1)
+  REMOTE_VERSION="${REMOTE_VERSION:-0}"
   BEHIND=$(echo "$REMOTE_VALUES" | sed -n '2p')
 
   echo "  Remote v: $REMOTE_VERSION"
